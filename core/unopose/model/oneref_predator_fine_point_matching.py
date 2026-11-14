@@ -16,6 +16,7 @@ class FinePointMatchingOneRef(nn.Module):
         self.cfg = cfg
         self.return_feat = return_feat
         self.nblock = self.cfg.nblock
+        self.dense_attention_type = cfg.get("dense_attention_type", "linear")
 
         self.in_proj = nn.Linear(cfg.input_dim, cfg.hidden_dim)
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.out_dim)
@@ -50,6 +51,8 @@ class FinePointMatchingOneRef(nn.Module):
                     focusing_factor=cfg.focusing_factor,
                     with_bg_token=True,
                     replace_bg_token=True,
+                    dense_attention_type=self.dense_attention_type,
+                    geo_cfg=cfg.get("geo_cfg", None),
                 )
             )
         self.transformers = nn.ModuleList(self.transformers)
@@ -75,11 +78,22 @@ class FinePointMatchingOneRef(nn.Module):
         f2 = self.in_proj(f2) + self.PE(p2)
         f2 = torch.cat([self.bg_token.repeat(B, 1, 1), f2], dim=1)  # adding bg
 
+        if self.dense_attention_type == "geo":
+            # Repositioned query coords (p1_) and template coords (p2) for the geo-aware dense layer, with a bg row
+            # prepended to match f1/f2's convention (see _sample_points in transformer.py). GeoAwareDenseLayer strips
+            # this bg row before computing its cross geometric embedding, so the +1e4 placeholder offset is irrelevant.
+            bg_pt1 = p1_[:, 0:1, :] + 1e4
+            bg_pt2 = p2[:, 0:1, :] + 1e4
+            points1 = torch.cat([bg_pt1, p1_], dim=1)
+            points2 = torch.cat([bg_pt2, p2], dim=1)
+        else:
+            points1 = points2 = None
+
         atten_list = []
         score_list = []
         saliency_list = []
         for idx in range(self.nblock):
-            f1, f2 = self.transformers[idx](f1, geo1, fps_idx1, f2, geo2, fps_idx2)
+            f1, f2 = self.transformers[idx](f1, geo1, fps_idx1, f2, geo2, fps_idx2, points0=points1, points1=points2)
             scores = self.score_heads[idx](torch.cat((f1, f2), dim=1))
 
             if self.training or idx == self.nblock - 1:
@@ -124,6 +138,8 @@ class FinePointMatchingOneRef(nn.Module):
                 p2,
                 # end_points["model"] / (radius.reshape(-1, 1, 1) + 1e-6),
                 None,
+                irls_iters=self.cfg.get("irls_iters", 0),
+                irls_c=self.cfg.get("irls_c", 3.0),
             )
             end_points["pred_R"] = pred_R
             end_points["pred_t"] = pred_t * (radius.reshape(-1, 1) + 1e-6)

@@ -31,16 +31,22 @@ p = {
     "meshlab_server_path": config.meshlab_server_path,
     # Path to scripts/meshlab_scripts/remesh_for_eval.mlx.
     "meshlab_script_path": os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "meshlab_scripts", r"remesh_for_eval_cell=0.25.mlx"
+        os.path.dirname(os.path.realpath(__file__)),
+        "meshlab_scripts",
+        r"remesh_for_eval_cell=0.25.mlx",
     ),
 }
 ################################################################################
 
 
 # Load dataset parameters.
-dp_model_in = dataset_params.get_model_params(p["datasets_path"], p["dataset"], p["model_in_type"])
+dp_model_in = dataset_params.get_model_params(
+    p["datasets_path"], p["dataset"], p["model_in_type"]
+)
 
-dp_model_out = dataset_params.get_model_params(p["datasets_path"], p["dataset"], p["model_out_type"])
+dp_model_out = dataset_params.get_model_params(
+    p["datasets_path"], p["dataset"], p["model_out_type"]
+)
 
 # Attributes to save for the output models.
 attrs_to_save = []
@@ -55,7 +61,11 @@ for obj_id in dp_model_in["obj_ids"]:
     misc.ensure_dir(os.path.dirname(model_out_path))
 
     misc.run_meshlab_script(
-        p["meshlab_server_path"], p["meshlab_script_path"], model_in_path, model_out_path, attrs_to_save
+        p["meshlab_server_path"],
+        p["meshlab_script_path"],
+        model_in_path,
+        model_out_path,
+        attrs_to_save,
     )
 
 misc.log("Done.")

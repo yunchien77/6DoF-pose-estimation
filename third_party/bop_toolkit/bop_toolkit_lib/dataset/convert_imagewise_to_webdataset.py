@@ -82,7 +82,10 @@ def convert_imagewise_to_webdataset(
 ):
     wds_dir.mkdir(exist_ok=True)
     shard_writer = wds.ShardWriter(
-        pattern=str(wds_dir / "shard-%06d.tar"), start_shard=start_shard, maxcount=maxcount, encoder=False
+        pattern=str(wds_dir / "shard-%06d.tar"),
+        start_shard=start_shard,
+        maxcount=maxcount,
+        encoder=False,
     )
     infos = bop_imagewise.load_image_infos(input_dir, image_keys[0])
 

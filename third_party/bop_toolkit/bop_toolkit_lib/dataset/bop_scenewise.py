@@ -33,7 +33,9 @@ def instance_id_from_mask_filename(fn):
     return int(re.findall("\d+", fn)[-1])
 
 
-def load_masks(scene_dir, image_id, mask_type="mask", n_instances=None, instance_ids=None):
+def load_masks(
+    scene_dir, image_id, mask_type="mask", n_instances=None, instance_ids=None
+):
     """Loads one or multiple object masks stored as individual .png files.
 
     :param scene_dir: Path to the scene directory.
@@ -53,10 +55,15 @@ def load_masks(scene_dir, image_id, mask_type="mask", n_instances=None, instance
         instance_ids = range(n_instances)
 
     if instance_ids is not None:
-        mask_paths = (scene_dir / mask_type / f"{image_id:06d}_{instance_id:06d}.png" for instance_id in instance_ids)
+        mask_paths = (
+            scene_dir / mask_type / f"{image_id:06d}_{instance_id:06d}.png"
+            for instance_id in instance_ids
+        )
     else:
         mask_paths = (scene_dir / mask_type).glob(f"{image_id:06d}_*.png")
-        mask_paths = sorted(mask_paths, key=lambda p: instance_id_from_mask_filename(p.name))
+        mask_paths = sorted(
+            mask_paths, key=lambda p: instance_id_from_mask_filename(p.name)
+        )
     masks = np.stack([inout.load_im(p) for p in mask_paths])
     return masks
 
@@ -253,22 +260,36 @@ def load_image_data(
         image_data["gt"] = gt
 
     if load_gt_info:
-        scene_gt_info = inout.load_json(scene_dir / "scene_gt_info.json", keys_to_int=True)
+        scene_gt_info = inout.load_json(
+            scene_dir / "scene_gt_info.json", keys_to_int=True
+        )
         gt_info = scene_gt_info[image_id]
         if instance_ids is not None:
-            gt_info = [gt_info_n for n, gt_info_n in enumerate(gt_info) if n in instance_ids]
+            gt_info = [
+                gt_info_n for n, gt_info_n in enumerate(gt_info) if n in instance_ids
+            ]
         gt_info = [inout._gt_as_numpy(gt_info_n) for gt_info_n in gt_info]
         n_instances = len(gt_info)
         image_data["gt_info"] = gt_info
 
     if load_mask_visib:
         mask_visib = load_masks(
-            scene_dir, image_id, mask_type="mask_visib", n_instances=n_instances, instance_ids=instance_ids
+            scene_dir,
+            image_id,
+            mask_type="mask_visib",
+            n_instances=n_instances,
+            instance_ids=instance_ids,
         )
         image_data["mask_visib"] = mask_visib
 
     if load_mask:
-        mask = load_masks(scene_dir, image_id, mask_type="mask", n_instances=n_instances, instance_ids=instance_ids)
+        mask = load_masks(
+            scene_dir,
+            image_id,
+            mask_type="mask",
+            n_instances=n_instances,
+            instance_ids=instance_ids,
+        )
         image_data["mask"] = mask
 
     return image_data

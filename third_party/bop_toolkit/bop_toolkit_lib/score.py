@@ -30,19 +30,26 @@ def calc_ap(rec, pre):
 
     :param rec: A list (or 1D ndarray) of recall rates.
     :param pre: A list (or 1D ndarray) of precision rates.
+    :param coco_interpolation: If True, do interpolation at these recall thresholds as done in COCO
     :return: Average Precision - the area under the monotonically decreasing
              version of the precision/recall curve given by rec and pre.
     """
     # Sorts the precision/recall points by increasing recall.
     i = np.argsort(rec)
-
     mrec = np.concatenate(([0], np.array(rec)[i], [1]))
     mpre = np.concatenate(([0], np.array(pre)[i], [0]))
     assert mrec.shape == mpre.shape
-    for i in range(mpre.size - 3, -1, -1):
-        mpre[i] = max(mpre[i], mpre[i + 1])
-    i = np.nonzero(mrec[1:] != mrec[:-1])[0] + 1
-    ap = np.sum((mrec[i] - mrec[i - 1]) * mpre[i])
+
+    # Follow COCO API and interpolate at these recall thresholds.
+    # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/cocoeval.py#L507
+    rec_thresholds = np.linspace(0.0, 1.00, 101, endpoint=True)
+    interpolated_precisions = []
+    for rt in rec_thresholds:
+        if np.any(mrec >= rt):
+            interpolated_precisions.append(np.max(mpre[mrec >= rt]))
+        else:
+            interpolated_precisions.append(0.0)
+    ap = np.mean(interpolated_precisions)
     return ap
 
 
@@ -136,9 +143,13 @@ def calc_localization_scores(scene_ids, obj_ids, matches, n_top, do_print=True):
     }
 
     if do_print:
-        obj_recalls_str = ", ".join(["{}: {:.3f}".format(i, s) for i, s in scores["obj_recalls"].items()])
+        obj_recalls_str = ", ".join(
+            ["{}: {:.3f}".format(i, s) for i, s in scores["obj_recalls"].items()]
+        )
 
-        scene_recalls_str = ", ".join(["{}: {:.3f}".format(i, s) for i, s in scores["scene_recalls"].items()])
+        scene_recalls_str = ", ".join(
+            ["{}: {:.3f}".format(i, s) for i, s in scores["scene_recalls"].items()]
+        )
 
         misc.log("")
         misc.log("GT count:           {:d}".format(scores["gt_count"]))
@@ -152,6 +163,111 @@ def calc_localization_scores(scene_ids, obj_ids, matches, n_top, do_print=True):
         misc.log("")
 
     return scores
+
+
+def calc_pose_detection_scores(
+    scene_ids,
+    obj_ids,
+    matches,
+    ests_info,
+    visib_gt_min,
+    do_print=True,
+):
+    """Calculates accuracy scores for the 6D object detection task.
+    :param scene_ids: ID's of considered scenes.
+    :param obj_ids: ID's of considered objects.
+    :param matches: List of per-GT dictionary with info about GT-to-detection matching.
+      (see pose_matching.py for details).
+    :param ests_info: List of per-detection dictionary with the following items:
+      - 'im_id': Image ID.
+      - 'obj_id': Object ID.
+      - 'est_id': ID of the pose estimate.
+      - 'score': Confidence score of the pose estimate.
+      - 'errors': Dictionary mapping ground-truth ID's to errors of the pose
+          estimate w.r.t. the ground-truth poses.
+    :param visib_gt_min: GT annotations visible from less than this threshold are ignored.
+        from less than visib_gt_min.
+    :param do_print: Whether to print the scores to the standard output.
+    :return: Dictionary with the per-object AP scores.
+    """
+
+    scores_per_object = {}
+    num_targets_per_object = {}
+
+    for obj_id in obj_ids:
+
+        # Get mapping from GTs (keep only those that are visible enough) to matched detections.
+        obj_gt_to_est_matching = []
+        est_signatures_matched = []
+        est_signatures_to_ignore = []
+        for match in matches:
+            if match["obj_id"] == obj_id:
+                
+                # Unique signature of the estimate.
+                est_signature = (match["scene_id"], match["im_id"], match["obj_id"], match["est_id"])
+
+                if match["gt_visib_fract"] >= visib_gt_min:
+                    # Consider only GTs which are sufficiently visible.
+                    obj_gt_to_est_matching.append(match)
+
+                    if match["est_id"] != -1:
+                        est_signatures_matched.append(est_signature)
+                else:
+                    # Detections matched to invisible GTs will be ignored.
+                    est_signatures_to_ignore.append(est_signature)
+
+        # Number of valid GT annotations for the current object ID.
+        num_obj_gts = len(obj_gt_to_est_matching)
+        num_targets_per_object[obj_id] = num_obj_gts
+
+        # Detections of the current object which are not associated with any ignored GT.
+        obj_ests = []
+        for est in ests_info:
+            est_signature = (est["scene_id"], est["im_id"], est["obj_id"], est["est_id"])
+            if est["obj_id"] == obj_id and est_signature not in est_signatures_to_ignore:
+                est["matched"] = est_signature in est_signatures_matched
+                obj_ests.append(est)
+
+        # Number of valid detections for the current object.
+        num_obj_ests = len(obj_ests)
+
+        # Sort detections by confidence scores (necessary for calculating precion-recall curve).
+        obj_ests_sorted = sorted(obj_ests, key=lambda x: x["score"], reverse=True)
+
+        # Binary indicators of detection types:
+        true_positive_mask = np.zeros(num_obj_ests, dtype=np.bool_)
+        false_positive_mask = np.zeros(num_obj_ests, dtype=np.bool_)
+
+        # We iterate over sorted estimates and set the masks.
+        for i, est in enumerate(obj_ests_sorted):
+            if est["matched"]:
+                true_positive_mask[i] = True
+            else:
+                false_positive_mask[i] = True
+
+        # Cumulative sums (this can be done as we sorted the matches at the beginning).
+        true_positive_cumsum = np.cumsum(true_positive_mask)
+        false_positive_cumsum = np.cumsum(false_positive_mask)
+
+        # Calculate recall values.
+        recalls = true_positive_cumsum / float(num_obj_gts)
+
+        # Calculate precision values.
+        precisions = true_positive_cumsum / (true_positive_cumsum + false_positive_cumsum)
+        precisions[np.isinf(precisions)] = 0.0
+        precisions[np.isnan(precisions)] = 0.0
+
+        # Calculate AP (Average Precision).
+        obj_ap = calc_ap(recalls, precisions)
+        scores_per_object[obj_id] = obj_ap
+
+        if do_print:
+            misc.log(f"Object {obj_id:d} AP: {obj_ap:.4f}")
+
+    return {
+        "scores": scores_per_object,
+        "num_targets_per_object": num_targets_per_object,
+    }
 
 
 if __name__ == "__main__":

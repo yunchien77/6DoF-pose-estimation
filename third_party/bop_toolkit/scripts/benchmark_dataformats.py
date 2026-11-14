@@ -145,7 +145,9 @@ then the following structure is assumed:
     args = parser.parse_args()
     root_dir = pathlib.Path(args.root)
 
-    timings = benchmark_wds_sequential(root_dir / "train_pbr_web" / f"shard-{0:06d}.tar", n_images=1000)
+    timings = benchmark_wds_sequential(
+        root_dir / "train_pbr_web" / f"shard-{0:06d}.tar", n_images=1000
+    )
     print("# WebDataset, Sequential access")
     print_summary(timings[5:])
 

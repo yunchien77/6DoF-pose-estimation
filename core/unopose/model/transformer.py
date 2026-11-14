@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 import numpy as np
 
@@ -350,6 +351,176 @@ class GeometricStructureEmbedding(nn.Module):
         return embeddings
 
 
+class CrossGeometricStructureEmbedding(nn.Module):
+    """Like GeometricStructureEmbedding, but for a QUERY point set attending
+    to a DIFFERENT key point set (dense-to-sparse cross-attention) rather
+    than a set attending to itself. Produces (B, N_query, N_key, hidden_dim)
+    pairwise distance+angle embeddings, fed to RPEMultiHeadAttention via
+    its embed_qk argument exactly the way GeometricStructureEmbedding
+    already feeds GeometricTransformer's sparse self/cross blocks.
+
+    Motivation (see BOTTLENECK_ANALYSIS.md section 4a): the fine stage's
+    dense-to-sparse cross-attention (SparseToDenseTransformer.dense_layer)
+    currently has NO geometric-structure awareness at all -- only a locally
+    rotation-invariant positional encoding (LRF-based, PositionalEncoding in
+    oneref_predator_fine_point_matching.py) that by design discards exactly
+    the angular information needed to disambiguate points on a locally
+    self-similar/rotationally-symmetric patch (verified: the true match's
+    wrong-picked competitor shares the true point's height and radius from
+    the object's own axis, differing mainly by angle -- "ring confusion").
+    Full softmax attention (tested, ruled out with a matched control) made
+    ranking worse because it sharpens discrimination among purely local
+    CONTENT features but still has no access to non-local geometric context
+    to break the tie. This gives the attention a genuinely different signal:
+    "point i is at distance d and angle theta from point j", which differs
+    even for two points that look content-identical up close.
+
+    Angular reference vectors are drawn from each KEY point's own k nearest
+    neighbors within the (smaller, more stable) key set, rather than
+    attempting a per-query-point neighbor structure in the much larger
+    dense query set -- this mirrors GeometricStructureEmbedding's own
+    "neighbors define the local frame" convention, just anchored on the
+    side with a stable canonical downsample (the 196-point FPS subset)
+    instead of the full 2048-point dense cloud.
+    """
+
+    def __init__(self, cfg):
+        super(CrossGeometricStructureEmbedding, self).__init__()
+        self.sigma_d = cfg.sigma_d
+        self.sigma_a = cfg.sigma_a
+        self.factor_a = 180.0 / (self.sigma_a * np.pi)
+        self.angle_k = cfg.angle_k
+        # N_query (dense, ~2048) x N_key (sparse, ~196) x angle_k x hidden_dim
+        # is >10x the element count of the self-only GeometricStructureEmbedding's
+        # N_key x N_key case (coarse/sparse-only, ~196x196) it's modeled on --
+        # materializing the full pre-reduction (B,N,M,k,hidden_dim) tensor at
+        # once OOMs a 24GB GPU during training (verified). Looping over the
+        # query dimension in chunks keeps the SAME math/order of operations
+        # (embed indices -> project -> reduce over k, exactly mirroring
+        # GeometricStructureEmbedding) but bounds peak memory to one chunk's
+        # worth regardless of how many dense query points there are.
+        self.query_chunk_size = cfg.get("query_chunk_size", 256)
+        # Ablation switch (BOTTLENECK_ANALYSIS.md section 5b follow-up): isolates
+        # whether the angle term contributes anything beyond the distance term,
+        # now that large_marker's re-verification showed geo-attention's AR gain
+        # is NOT coming from fixing ring confusion (the angle term's intended
+        # purpose). When True, forward_chunk returns d_embeddings alone --
+        # proj_a/the angle computation are skipped entirely, not just masked,
+        # so this is a true ablation, not a zero-input pass-through.
+        self.disable_angle = cfg.get("disable_angle", False)
+        # Complementary ablation: the distance-only probe showed the angle term
+        # contributes nothing detectable -- this isolates the mirror question,
+        # whether the distance term alone accounts for the whole gain, or the
+        # angle term alone can reproduce it too. When True, forward_chunk
+        # returns a_embeddings alone -- proj_d/the distance computation are
+        # skipped entirely, not just masked. Mutually exclusive with
+        # disable_angle (checked in forward_chunk).
+        self.disable_distance = cfg.get("disable_distance", False)
+        assert not (self.disable_angle and self.disable_distance), \
+            "disable_angle and disable_distance are mutually exclusive"
+
+        self.embedding = SinusoidalPositionalEmbedding(cfg.hidden_dim)
+        self.proj_d = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
+        self.proj_a = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
+
+        self.reduction_a = cfg.reduction_a
+        if self.reduction_a not in ["max", "mean"]:
+            raise ValueError(f"Unsupported reduction mode: {self.reduction_a}.")
+
+    @torch.no_grad()
+    def _key_side_ref_vectors(self, key_points):
+        r"""Key-point-only part of the angle computation (no query
+        dependency) -- computed once and reused across all query chunks.
+
+        Args:
+            key_points: torch.Tensor (B, M, 3)
+
+        Returns:
+            ref_vectors: torch.Tensor (B, M, k, 3), each key point's vector
+                to its own k nearest neighbors within the key set.
+        """
+        batch_size, num_key, _ = key_points.shape
+        k = self.angle_k
+        key_dist_map = torch.sqrt(pairwise_distance(key_points, key_points))  # (B, M, M)
+        knn_indices = key_dist_map.topk(k=k + 1, dim=2, largest=False)[1][:, :, 1:]  # (B, M, k)
+        knn_indices = knn_indices.unsqueeze(3).expand(batch_size, num_key, k, 3)  # (B, M, k, 3)
+        expanded_key_points = key_points.unsqueeze(1).expand(batch_size, num_key, num_key, 3)  # (B, M, M, 3)
+        knn_points = torch.gather(expanded_key_points, dim=2, index=knn_indices)  # (B, M, k, 3)
+        ref_vectors = knn_points - key_points.unsqueeze(2)  # (B, M, k, 3), key point -> its own neighbors
+        return ref_vectors
+
+    @torch.no_grad()
+    def get_embedding_indices_chunk(self, query_chunk, key_points, ref_vectors):
+        r"""
+        Args:
+            query_chunk: torch.Tensor (B, Nc, 3), a slice of the query points
+            key_points: torch.Tensor (B, M, 3)
+            ref_vectors: torch.Tensor (B, M, k, 3), from _key_side_ref_vectors
+
+        Returns:
+            d_indices: torch.FloatTensor (B, Nc, M)
+            a_indices: torch.FloatTensor (B, Nc, M, k)
+        """
+        batch_size, num_query, _ = query_chunk.shape
+        num_key = key_points.shape[1]
+        k = self.angle_k
+
+        dist_map = torch.sqrt(pairwise_distance(query_chunk, key_points))  # (B, Nc, M)
+        d_indices = dist_map / self.sigma_d
+
+        ref_vectors_exp = ref_vectors.unsqueeze(1).expand(batch_size, num_query, num_key, k, 3)  # (B, Nc, M, k, 3)
+        anc_vectors = query_chunk.unsqueeze(2) - key_points.unsqueeze(1)  # (B, Nc, M, 3), key point -> query point
+        anc_vectors = anc_vectors.unsqueeze(3).expand(batch_size, num_query, num_key, k, 3)  # (B, Nc, M, k, 3)
+
+        sin_values = torch.linalg.norm(torch.cross(ref_vectors_exp, anc_vectors, dim=-1), dim=-1)  # (B, Nc, M, k)
+        cos_values = torch.sum(ref_vectors_exp * anc_vectors, dim=-1)  # (B, Nc, M, k)
+        angles = torch.atan2(sin_values, cos_values)  # (B, Nc, M, k)
+        a_indices = angles * self.factor_a
+
+        return d_indices, a_indices
+
+    def forward_chunk(self, query_chunk, key_points, ref_vectors):
+        """Embedding for ONE query chunk only -- the piece GeoAwareDenseLayer
+        calls directly (interleaved with attention, per chunk) so the full
+        (B, N, M, hidden_dim) embedding is never materialized/retained at
+        once; see forward()'s docstring note for why that matters."""
+        d_indices, a_indices = self.get_embedding_indices_chunk(query_chunk, key_points, ref_vectors)
+
+        if not self.disable_distance:
+            d_embeddings = self.embedding(d_indices)
+            d_embeddings = self.proj_d(d_embeddings)
+
+        if self.disable_angle:
+            return d_embeddings
+
+        a_embeddings = self.embedding(a_indices)
+        a_embeddings = self.proj_a(a_embeddings)
+        if self.reduction_a == "max":
+            a_embeddings = a_embeddings.max(dim=3)[0]
+        else:
+            a_embeddings = a_embeddings.mean(dim=3)
+
+        if self.disable_distance:
+            return a_embeddings
+
+        return d_embeddings + a_embeddings  # (B, Nc, M, hidden_dim)
+
+    def forward(self, query_points, key_points):
+        """Convenience full-tensor version (materializes and retains the
+        entire (B, N, M, hidden_dim) result) -- fine for the coarse-scale
+        self-attention use case this class is modeled on, but NOT what
+        GeoAwareDenseLayer uses for the much larger dense-to-sparse case
+        (see its forward, which calls forward_chunk directly per query
+        chunk, interleaved with attention, to bound peak memory)."""
+        num_query = query_points.shape[1]
+        ref_vectors = self._key_side_ref_vectors(key_points)
+        chunks = [
+            self.forward_chunk(query_points[:, start:start + self.query_chunk_size, :], key_points, ref_vectors)
+            for start in range(0, num_query, self.query_chunk_size)
+        ]
+        return torch.cat(chunks, dim=1)  # (B, N, M, hidden_dim)
+
+
 class RPEMultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads, dropout=None):
         super(RPEMultiHeadAttention, self).__init__()
@@ -612,6 +783,80 @@ class LinearTransformerLayer(nn.Module):
         return output_states
 
 
+class GeoAwareDenseLayer(nn.Module):
+    """Geometric-structure-aware alternative to LinearTransformerLayer for
+    SparseToDenseTransformer.dense_layer. Computes a CrossGeometricStructureEmbedding
+    between the dense query points and the sparse key points, then feeds it
+    into RPEAttentionLayer (already used by GeometricTransformer for the
+    sparse self/cross blocks, reused verbatim here) so attention scores are
+    informed by explicit pairwise distance/angle relationships, not just
+    local content similarity. See CrossGeometricStructureEmbedding's
+    docstring for the full motivation (ring-confusion / local rotational
+    symmetry, BOTTLENECK_ANALYSIS.md section 4a).
+    """
+
+    def __init__(self, d_model, num_heads, geo_cfg, dropout=None, activation_fn="ReLU"):
+        super(GeoAwareDenseLayer, self).__init__()
+        self.geo_embedding = CrossGeometricStructureEmbedding(geo_cfg)
+        self.attention = RPEAttentionLayer(d_model, num_heads, dropout=dropout)
+        self.output = AttentionOutput(d_model, dropout=dropout, activation_fn=activation_fn)
+        # Zero-init proj_p so attention_scores_p starts at exactly 0 --
+        # RPEMultiHeadAttention.forward computes
+        # attention_scores = (attention_scores_e + attention_scores_p) / sqrt(d),
+        # so this makes the block start EXACTLY equivalent to content-only
+        # attention (matching the old checkpoint's learned behavior) and
+        # only gradually learn to weigh in the geometric bias during
+        # fine-tuning, rather than corrupting attention with a random
+        # geometric term from step 0 (same warm-start philosophy as
+        # SpotGuidedAttention's zero-init, applied to the new term instead
+        # of the whole block).
+        nn.init.zeros_(self.attention.attention.proj_p.weight)
+        nn.init.zeros_(self.attention.attention.proj_p.bias)
+
+    def forward(self, input_states, memory_states, query_points, key_points):
+        """
+        input states: dense features (B, N, C)
+        memory states: sparse features (B, M, C)
+        query_points: dense point coordinates (B, N, 3)
+        key_points: sparse point coordinates (B, M, 3)
+
+        Computes the geo embedding and runs attention PER QUERY CHUNK, each
+        wrapped in activation checkpointing (torch.utils.checkpoint):
+        chunking the forward computation ALONE does not bound memory --
+        autograd still needs to save every chunk's intermediate activations
+        for the eventual single backward() call, so N=2048/M=196 OOMs a
+        24GB GPU regardless of chunk size (verified: ~6.6-6.9GB per call
+        whether chunk_size is 512, 256, or 128). Checkpointing each chunk
+        (recompute its forward during backward instead of saving
+        activations) is what actually bounds peak memory -- verified
+        empirically to cut this same case from ~6.9GB down to ~1.1GB.
+        """
+        chunk_size = self.geo_embedding.query_chunk_size
+        num_query = query_points.shape[1]
+        ref_vectors = self.geo_embedding._key_side_ref_vectors(key_points)
+
+        def run_chunk(query_chunk, input_chunk, memory_states, key_points, ref_vectors):
+            embed_qk_chunk = self.geo_embedding.forward_chunk(query_chunk, key_points, ref_vectors)
+            hidden_chunk, _attention_scores = self.attention(input_chunk, memory_states, embed_qk_chunk)
+            return hidden_chunk
+
+        hidden_chunks = []
+        for start in range(0, num_query, chunk_size):
+            query_chunk = query_points[:, start:start + chunk_size, :]
+            input_chunk = input_states[:, start:start + chunk_size, :]
+            if self.training:
+                hidden_chunk = checkpoint(
+                    run_chunk, query_chunk, input_chunk, memory_states, key_points, ref_vectors, use_reentrant=False
+                )
+            else:
+                hidden_chunk = run_chunk(query_chunk, input_chunk, memory_states, key_points, ref_vectors)
+            hidden_chunks.append(hidden_chunk)
+
+        hidden_states = torch.cat(hidden_chunks, dim=1)
+        output_states = self.output(hidden_states)
+        return output_states
+
+
 class SparseToDenseTransformer(nn.Module):
     def __init__(
         self,
@@ -624,10 +869,13 @@ class SparseToDenseTransformer(nn.Module):
         focusing_factor=3,
         with_bg_token=True,
         replace_bg_token=True,
+        dense_attention_type="linear",
+        geo_cfg=None,
     ):
         super(SparseToDenseTransformer, self).__init__()
         self.with_bg_token = with_bg_token
         self.replace_bg_token = replace_bg_token
+        self.dense_attention_type = dense_attention_type
 
         self.sparse_layer = GeometricTransformer(
             blocks=sparse_blocks,
@@ -638,19 +886,60 @@ class SparseToDenseTransformer(nn.Module):
             parallel=parallel,
             return_attention_scores=False,
         )
-        self.dense_layer = LinearTransformerLayer(d_model, num_heads, focusing_factor=focusing_factor)
+        # dense_attention_type="geo" swaps the sparse-to-dense cross-attention
+        # from FLatten-style linear attention (content-only, no geometric
+        # awareness) to CrossGeometricStructureEmbedding + RPE attention
+        # (explicit pairwise distance/angle bias) -- see GeoAwareDenseLayer's
+        # docstring for the motivation.
+        if dense_attention_type == "linear":
+            self.dense_layer = LinearTransformerLayer(d_model, num_heads, focusing_factor=focusing_factor)
+        elif dense_attention_type == "geo":
+            if geo_cfg is None:
+                raise ValueError("dense_attention_type='geo' requires geo_cfg (sigma_d/sigma_a/angle_k/reduction_a/hidden_dim)")
+            self.dense_layer = GeoAwareDenseLayer(d_model, num_heads, geo_cfg, activation_fn=activation_fn)
+        else:
+            raise ValueError(f"Unknown dense_attention_type: {dense_attention_type}")
 
     def forward(
-        self, dense_feats0, embeddings0, fps_idx0, dense_feats1, embeddings1, fps_idx1, masks0=None, masks1=None
+        self,
+        dense_feats0,
+        embeddings0,
+        fps_idx0,
+        dense_feats1,
+        embeddings1,
+        fps_idx1,
+        masks0=None,
+        masks1=None,
+        points0=None,
+        points1=None,
     ):
         # visual feats, geo feats, fps idx
         feats0 = self._sample_feats(dense_feats0, fps_idx0)
         feats1 = self._sample_feats(dense_feats1, fps_idx1)
+        need_points = self.dense_attention_type == "geo"
+        sparse_points0 = self._sample_points(points0, fps_idx0) if need_points else None
+        sparse_points1 = self._sample_points(points1, fps_idx1) if need_points else None
         feats0, feats1 = self.sparse_layer(feats0, embeddings0, feats1, embeddings1, masks0, masks1)
 
-        dense_feats0 = self._get_dense_feats(dense_feats0, feats0)
-        dense_feats1 = self._get_dense_feats(dense_feats1, feats1)
+        dense_feats0 = self._get_dense_feats(dense_feats0, feats0, points0, sparse_points0)
+        dense_feats1 = self._get_dense_feats(dense_feats1, feats1, points1, sparse_points1)
         return dense_feats0, dense_feats1
+
+    def _sample_points(self, points, fps_idx):
+        # Mirrors _sample_feats' bg_token handling, but the bg token has no
+        # real spatial location, and (like the caller's dense_feats0/1) is
+        # expected already prepended with a placeholder row at index 0 --
+        # mirrors _sample_feats exactly (same gather-then-reprepend order on
+        # the SAME already-bg-prepended tensor) so the sampled coordinates
+        # line up with whatever point _sample_feats' identical indexing
+        # actually selects, rather than introducing a second, possibly
+        # inconsistent convention.
+        if self.with_bg_token:
+            bg_point = points[:, 0:1, :].contiguous()
+        sampled = gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1, 2).contiguous()
+        if self.with_bg_token:
+            sampled = torch.cat([bg_point, sampled], dim=1)
+        return sampled
 
     def _sample_feats(self, dense_feats, fps_idx):
         if self.with_bg_token:
@@ -661,11 +950,17 @@ class SparseToDenseTransformer(nn.Module):
             feats = torch.cat([bg_token, feats], dim=1)
         return feats
 
-    def _get_dense_feats(self, dense_feats, feats):
+    def _get_dense_feats(self, dense_feats, feats, points=None, sparse_points=None):
+        extra_args = ()
+        if self.dense_attention_type == "geo":
+            # GeoAwareDenseLayer additionally needs the real (bg-stripped)
+            # coordinates of both sides to compute the cross geometric
+            # embedding -- LinearTransformerLayer takes no such argument.
+            extra_args = (points[:, 1:, :].contiguous(), sparse_points[:, 1:, :].contiguous())
         if self.with_bg_token and self.replace_bg_token:
             bg_token = feats[:, 0:1, :].contiguous()
-            dense_feats = self.dense_layer(dense_feats[:, 1:, :].contiguous(), feats[:, 1:, :].contiguous())
+            dense_feats = self.dense_layer(dense_feats[:, 1:, :].contiguous(), feats[:, 1:, :].contiguous(), *extra_args)
             dense_feats = torch.cat([bg_token, dense_feats], dim=1)
         else:
-            dense_feats = self.dense_layer(dense_feats, feats)
+            dense_feats = self.dense_layer(dense_feats, feats, *extra_args)
         return dense_feats

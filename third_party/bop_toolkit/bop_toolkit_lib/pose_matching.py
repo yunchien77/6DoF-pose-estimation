@@ -55,6 +55,7 @@ def match_poses(errs, error_ths, max_ests_count=0, gt_valid_mask=None):
         best_gt_id = -1
         best_error = list(error_ths)
         for gt_id, error in e["errors"].items():
+            gt_visib_fract = e["gt_visib_fracts"][gt_id]
             # If the mask of valid GT poses is not provided, consider all valid.
             is_valid = not gt_valid_mask or gt_valid_mask[gt_id]
 
@@ -65,13 +66,16 @@ def match_poses(errs, error_ths, max_ests_count=0, gt_valid_mask=None):
                 if np.all([error[i] < best_error[i] for i in range(error_num_elems)]):
                     best_gt_id = gt_id
                     best_error = error
+                    gt_visib_fract_of_best_gt_id = gt_visib_fract
 
         if best_gt_id >= 0:
             # Mark the GT pose as matched.
             gt_matched.append(best_gt_id)
 
             # Error normalized by the threshold.
-            best_errors_normed = [best_error[i] / float(error_ths[i]) for i in range(error_num_elems)]
+            best_errors_normed = [
+                best_error[i] / float(error_ths[i]) for i in range(error_num_elems)
+            ]
 
             # Save info about the match.
             matches.append(
@@ -81,13 +85,16 @@ def match_poses(errs, error_ths, max_ests_count=0, gt_valid_mask=None):
                     "score": e["score"],
                     "error": best_error,
                     "error_norm": best_errors_normed,
+                    "gt_visib_fract": gt_visib_fract_of_best_gt_id,
                 }
             )
 
     return matches
 
 
-def match_poses_scene(scene_id, scene_gt, scene_gt_valid, scene_errs, correct_th, n_top):
+def match_poses_scene(
+    scene_id, scene_gt, scene_gt_info, scene_gt_valid, scene_errs, correct_th, n_top
+):
     """Matches the estimated poses to the ground-truth poses in one scene.
 
     :param scene_id: Scene ID.
@@ -119,6 +126,7 @@ def match_poses_scene(scene_id, scene_gt, scene_gt_valid, scene_errs, correct_th
         im_matches = []
 
         for gt_id, gt in enumerate(im_gts):
+            
             im_matches.append(
                 {
                     "scene_id": scene_id,
@@ -130,13 +138,17 @@ def match_poses_scene(scene_id, scene_gt, scene_gt_valid, scene_errs, correct_th
                     "error": -1,
                     "error_norm": -1,
                     "valid": scene_gt_valid[im_id][gt_id],
+                    "gt_visib_fract": scene_gt_info[im_id][gt_id]["visib_fract"], 
                 }
             )
 
         # Treat estimates of each object separately.
         im_obj_ids = set([gt["obj_id"] for gt in im_gts])
         for obj_id in im_obj_ids:
-            if im_id in scene_errs_org.keys() and obj_id in scene_errs_org[im_id].keys():
+            if (
+                im_id in scene_errs_org.keys()
+                and obj_id in scene_errs_org[im_id].keys()
+            ):
                 # Greedily match the estimated poses to the ground truth poses.
                 errs_im_obj = scene_errs_org[im_id][obj_id]
                 ms = match_poses(errs_im_obj, correct_th, n_top, scene_gt_valid[im_id])

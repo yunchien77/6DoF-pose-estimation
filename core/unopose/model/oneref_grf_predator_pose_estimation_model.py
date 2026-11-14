@@ -22,6 +22,17 @@ class UNOPose(nn.Module):
         self.coarse_point_matching = CoarsePointMatchingOneRef(cfg.coarse_point_matching)
         self.fine_point_matching = FinePointMatchingOneRef(cfg.fine_point_matching)
 
+        if cfg.get("finetune_fine_only", False):
+            # Train only the fine-stage matching module (PE, in_proj, the transformer blocks, score heads);
+            # the backbone, geo_embedding and coarse_point_matching stay frozen. Used to fine-tune the
+            # geo-attention fine stage on top of the production baseline checkpoint (configs/cfg_geoattn.py).
+            n_frozen = 0
+            for name, p in self.named_parameters():
+                if not name.startswith("fine_point_matching"):
+                    p.requires_grad = False
+                    n_frozen += 1
+            assert n_frozen > 0, "finetune_fine_only=True but found nothing to freeze"
+
     def forward(self, end_points):
         dense_pm, dense_fm, dense_po, dense_fo, radius = self.feature_extraction(end_points)
 

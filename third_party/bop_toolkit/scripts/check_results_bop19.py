@@ -29,7 +29,9 @@ p = {
 # ------------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--result_filenames", default=",".join(p["result_filenames"]), help="Comma-separated names of files with results."
+    "--result_filenames",
+    default=",".join(p["result_filenames"]),
+    help="Comma-separated names of files with results.",
 )
 args = parser.parse_args()
 

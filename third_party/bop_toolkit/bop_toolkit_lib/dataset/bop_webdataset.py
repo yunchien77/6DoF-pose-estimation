@@ -79,7 +79,9 @@ def decode_sample(
         image_data["camera"] = json.loads(sample["camera.json"])
 
     if decode_rgb:
-        image_data["im_rgb"] = inout.load_im(sample["rgb" + rgb_suffix]).astype(np.uint8)
+        image_data["im_rgb"] = inout.load_im(sample["rgb" + rgb_suffix]).astype(
+            np.uint8
+        )
 
     if decode_gray:
         image_data["im_gray"] = inout.load_im(sample["gray.tiff"]).astype(np.uint8)
@@ -91,10 +93,14 @@ def decode_sample(
         image_data["im_depth"] = im_depth
 
     if decode_gt:
-        image_data["gt"] = bop_imagewise.io_load_gt(io.BytesIO(sample["gt.json"]), instance_ids=instance_ids)
+        image_data["gt"] = bop_imagewise.io_load_gt(
+            io.BytesIO(sample["gt.json"]), instance_ids=instance_ids
+        )
 
     if decode_gt_info:
-        image_data["gt_info"] = bop_imagewise.io_load_gt(io.BytesIO(sample["gt_info.json"]), instance_ids=instance_ids)
+        image_data["gt_info"] = bop_imagewise.io_load_gt(
+            io.BytesIO(sample["gt_info.json"]), instance_ids=instance_ids
+        )
 
     if decode_mask_visib:
         image_data["mask_visib"] = bop_imagewise.io_load_masks(
@@ -102,7 +108,9 @@ def decode_sample(
         )
 
     if decode_mask:
-        image_data["mask"] = bop_imagewise.io_load_masks(io.BytesIO(sample["mask.json"]), instance_ids=instance_ids)
+        image_data["mask"] = bop_imagewise.io_load_masks(
+            io.BytesIO(sample["mask.json"]), instance_ids=instance_ids
+        )
 
     return image_data
 
@@ -155,10 +163,14 @@ def load_image_data(
         image_data["im_depth"] = im_depth
 
     if load_gt:
-        image_data["gt"] = bop_imagewise.io_load_gt(_load("gt.json", read=False), instance_ids=instance_ids)
+        image_data["gt"] = bop_imagewise.io_load_gt(
+            _load("gt.json", read=False), instance_ids=instance_ids
+        )
 
     if load_gt_info:
-        image_data["gt_info"] = bop_imagewise.io_load_gt(_load("gt_info.json", read=False), instance_ids=instance_ids)
+        image_data["gt_info"] = bop_imagewise.io_load_gt(
+            _load("gt_info.json", read=False), instance_ids=instance_ids
+        )
 
     if load_mask_visib:
         image_data["mask_visib"] = bop_imagewise.io_load_masks(
@@ -166,7 +178,9 @@ def load_image_data(
         )
 
     if load_mask:
-        image_data["mask"] = bop_imagewise.io_load_masks(_load("mask.json", read=False), instance_ids=instance_ids)
+        image_data["mask"] = bop_imagewise.io_load_masks(
+            _load("mask.json", read=False), instance_ids=instance_ids
+        )
 
     tar.close()
     return image_data

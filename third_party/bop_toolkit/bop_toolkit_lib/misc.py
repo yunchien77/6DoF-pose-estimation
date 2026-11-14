@@ -6,29 +6,27 @@
 import os
 import sys
 import datetime
-import pytz
 import math
 import subprocess
+import logging
+import argparse
+
 import numpy as np
 from scipy.spatial import distance
 
 from bop_toolkit_lib import transform
 
+logging.basicConfig()
+
 
 def log(s):
     """A logging function.
 
-    :param s: String to print (with the current date and time).
+    :param s: String to print (with the current UTC date and time).
     """
-    # Use UTC time for logging.
-    utc_now = pytz.utc.localize(datetime.datetime.utcnow())
-    # pst_now = utc_now.astimezone(pytz.timezone("America/Los_Angeles"))
-    utc_now_str = "{}/{}|{:02d}:{:02d}:{:02d}".format(
-        utc_now.month, utc_now.day, utc_now.hour, utc_now.minute, utc_now.second
-    )
-
-    # sys.stdout.write('{}: {}\n'.format(time.strftime('%m/%d|%H:%M:%S'), s))
-    sys.stdout.write("{}: {}\n".format(utc_now_str, s))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    utc_now_str = f"{now.month}/{now.day}|{now.hour:02d}:{now.minute:02d}:{now.second:02d}"
+    sys.stdout.write(f"{utc_now_str}: {s}\n")
     sys.stdout.flush()
 
 
@@ -128,14 +126,18 @@ class Precomputer(object):
         :return: hxw ndarray (Xs/depth_im, Ys/depth_im)
         """
         if depth_im.shape != Precomputer.depth_im_shape:
-            Precomputer.depth_im_shape = depth_im.shape
-            Precomputer.xs, Precomputer.ys = np.meshgrid(np.arange(depth_im.shape[1]), np.arange(depth_im.shape[0]))
+            Precomputer.xs, Precomputer.ys = np.meshgrid(
+                np.arange(depth_im.shape[1]), np.arange(depth_im.shape[0])
+            )
 
-        if depth_im.shape != Precomputer.depth_im_shape or not np.all(K == Precomputer.K):
+        if depth_im.shape != Precomputer.depth_im_shape or not np.all(
+            K == Precomputer.K
+        ):
             Precomputer.K = K
             Precomputer.pre_Xs = (Precomputer.xs - K[0, 2]) / np.float64(K[0, 0])
             Precomputer.pre_Ys = (Precomputer.ys - K[1, 2]) / np.float64(K[1, 1])
 
+        Precomputer.depth_im_shape = depth_im.shape
         return Precomputer.pre_Xs, Precomputer.pre_Ys
 
 
@@ -155,7 +157,9 @@ def depth_im_to_dist_im_fast(depth_im, K):
     pre_Xs, pre_Ys = Precomputer.precompute_lazy(depth_im, K)
 
     dist_im = np.sqrt(
-        np.multiply(pre_Xs, depth_im) ** 2 + np.multiply(pre_Ys, depth_im) ** 2 + depth_im.astype(np.float64) ** 2
+        np.multiply(pre_Xs, depth_im) ** 2
+        + np.multiply(pre_Ys, depth_im) ** 2
+        + depth_im.astype(np.float64) ** 2
     )
 
     return dist_im
@@ -177,7 +181,11 @@ def depth_im_to_dist_im(depth_im, K):
     Xs = np.multiply(xs - K[0, 2], depth_im) * (1.0 / K[0, 0])
     Ys = np.multiply(ys - K[1, 2], depth_im) * (1.0 / K[1, 1])
 
-    dist_im = np.sqrt(Xs.astype(np.float64) ** 2 + Ys.astype(np.float64) ** 2 + depth_im.astype(np.float64) ** 2)
+    dist_im = np.sqrt(
+        Xs.astype(np.float64) ** 2
+        + Ys.astype(np.float64) ** 2
+        + depth_im.astype(np.float64) ** 2
+    )
     # dist_im = np.linalg.norm(np.dstack((Xs, Ys, depth_im)), axis=2)  # Slower.
 
     return dist_im
@@ -223,7 +231,14 @@ def calc_3d_bbox(xs, ys, zs):
     """
     bb_min = [xs.min(), ys.min(), zs.min()]
     bb_max = [xs.max(), ys.max(), zs.max()]
-    return [bb_min[0], bb_min[1], bb_min[2], bb_max[0] - bb_min[0], bb_max[1] - bb_min[1], bb_max[2] - bb_min[2]]
+    return [
+        bb_min[0],
+        bb_min[1],
+        bb_min[2],
+        bb_max[0] - bb_min[0],
+        bb_max[1] - bb_min[1],
+        bb_max[2] - bb_min[2],
+    ]
 
 
 def iou(bb_a, bb_b):
@@ -353,7 +368,13 @@ def get_score_signature(correct_th, visib_gt_min):
     return eval_sign
 
 
-def run_meshlab_script(meshlab_server_path, meshlab_script_path, model_in_path, model_out_path, attrs_to_save):
+def run_meshlab_script(
+    meshlab_server_path,
+    meshlab_script_path,
+    model_in_path,
+    model_out_path,
+    attrs_to_save,
+):
     """Runs a MeshLab script on a 3D model.
 
     meshlabserver depends on X server. To remove this dependence (on linux), run:
@@ -379,7 +400,15 @@ def run_meshlab_script(meshlab_server_path, meshlab_script_path, model_in_path, 
       - wn -> wedge normals
       - wt -> wedge texture coords
     """
-    meshlabserver_cmd = [meshlab_server_path, "-s", meshlab_script_path, "-i", model_in_path, "-o", model_out_path]
+    meshlabserver_cmd = [
+        meshlab_server_path,
+        "-s",
+        meshlab_script_path,
+        "-i",
+        model_in_path,
+        "-o",
+        model_out_path,
+    ]
 
     if len(attrs_to_save):
         meshlabserver_cmd += ["-m"] + attrs_to_save
@@ -387,3 +416,103 @@ def run_meshlab_script(meshlab_server_path, meshlab_script_path, model_in_path, 
     log(" ".join(meshlabserver_cmd))
     if subprocess.call(meshlabserver_cmd) != 0:
         exit(-1)
+
+
+def run_command(cmd):
+    """Runs a command.
+
+    :param cmd: Command to run.
+    """
+    log("Running: " + " ".join(cmd))
+    if subprocess.call(cmd) != 0:
+        raise RuntimeError(f"{cmd} failed!")
+
+
+def get_logger(name: str):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+def start_disable_output(logfile):
+    # Open the logfile for append
+    with open(logfile, "a") as log_file:
+        # Save the original stdout file descriptor
+        original_stdout = os.dup(1)
+
+        # Redirect stdout to the log file
+        os.dup2(log_file.fileno(), 1)
+
+        # Return the original stdout file descriptor
+        return original_stdout
+
+
+def stop_disable_output(original_stdout):
+    # Restore the original stdout file descriptor
+    os.dup2(original_stdout, 1)
+
+
+def get_eval_calc_errors_script_name(use_gpu, error_type, dataset):
+    """Return tuple (calc_error_script, is_gpu_script_used"""
+    cpu_script = "eval_calc_errors.py"
+    gpu_script = "eval_calc_errors_gpu.py"
+
+    if use_gpu and error_type in ["mssd", "mspd"]:
+        # mspd not supported for gpus for hot3d dataset
+        if error_type != "mspd" or dataset != "hot3d":
+            return gpu_script, True
+    return cpu_script, False
+
+
+def reorganize_targets(targets, organize_by_obj_ids=False):
+    """
+    Reorganizes the targets by scene_id, im_id, and optionally obj_id.
+
+    # targets_org : {"scene_id": {"im_id": {5: {"im_id": 3, "inst_count": 1, "obj_id": 3, "scene_id": 48}}}}
+
+    :param targets: List of targets.
+    :param organize_by_obj_ids: Whether to organize the targets by obj_id.
+    :return targets_org: Organized targets.
+    """
+    targets_org = {}
+
+    for target in targets:
+        if organize_by_obj_ids:
+            targets_org.setdefault(target["scene_id"], {}).setdefault(target["im_id"], {})[target["obj_id"]] = target
+        else:
+            targets_org.setdefault(target["scene_id"], {})[target["im_id"]] = target
+
+    return targets_org
+
+
+def parse_gt_poses_from_scene_im(scene_gt_img, gt_ids=None):
+    """Parses GT poses from scene_gt for an img for the specified gt_ids."""
+    poses = []
+    gt_ids = list(range(len(scene_gt_img))) if gt_ids is None else gt_ids
+    for gt_id in gt_ids:
+        gt = scene_gt_img[gt_id]
+        # skip fully occluded masks - all values are -1
+        if all(val == -1 for val in gt["cam_t_m2c"]):
+            continue
+        poses.append(
+            {
+                "obj_id": gt["obj_id"],
+                "R": gt["cam_R_m2c"],
+                "t": gt["cam_t_m2c"],
+                "text_info": [
+                    {
+                        "name": "",
+                        "val": "{}:{}".format(gt["obj_id"], gt_id),
+                        "fmt": "",
+                    }
+                ],
+            }
+        )
+
+    return poses
+
+
+def add_argument_bool(parser: argparse.ArgumentParser, arg_name: str, default: bool):
+    parser.add_argument(f"--{arg_name}", action="store_true")
+    parser.add_argument(f"--no_{arg_name}", dest=f"{arg_name}", action="store_false")
+    parser.set_defaults(**{f"{arg_name}": default})

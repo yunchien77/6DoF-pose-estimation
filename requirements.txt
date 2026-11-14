@@ -1,5 +1,5 @@
 accelerate==0.25.0
-ai==1.0.3
+ai.cs==1.0.3
 blenderproc==2.8.0
 cffi==1.15.1
 chardet==5.2.0

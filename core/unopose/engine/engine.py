@@ -58,6 +58,11 @@ def do_save_results(cfg, model, iteration=None):
         infer_func = inference_and_save
     logger.info(f"infer_func: {infer_func}")
 
+    if cfg.test.get("pipeline_hooks", ""):  # runtime pipeline components (save_unopose.sh --pipeline m2,verifier)
+        from core.unopose.pipelines.install import install_hooks
+
+        install_hooks(cfg)
+
     if cfg.test.amp.enabled:
         logger.info("amp test")
     with torch.cuda.amp.autocast(enabled=cfg.test.amp.enabled):
@@ -71,11 +76,12 @@ def do_save_results(cfg, model, iteration=None):
         )
 
     logger.info("evaluation...")
+    targets_name = cfg.bop_eval.get("targets_name", "test_targets_bop19.json")  # set by save_unopose.sh --benchmark
     cmd = f"PYTHONPATH=$PYTHONPATH:{PROJ_DIR}:{PROJ_DIR}/third_party/bop_toolkit \
         python {PROJ_DIR}/core/unopose/engine/bop_eval_utils.py \
         --script-path third_party/bop_toolkit/scripts/eval_pose_results_more.py \
-        --targets_name test_targets_bop19.json \
-        --error_types 'vsd,mssd,mspd' \
+        --targets_name {targets_name} \
+        --error_types 'vsd,mssd,mspd,add,adi' \
         --split test \
         --dataset {dataset_name} \
         --result_names {save_name} \
@@ -146,45 +152,62 @@ def do_train(cfg, args, model, optimizer, resume=False):
                 data_loader.dataset.reset()
                 data_loader_iter = iter(data_loader)
 
-            data = next(data_loader_iter)
-
             if iter_time is not None:
                 storage.put_scalar("time", time.perf_counter() - iter_time)
             iter_time = time.perf_counter()
 
-            batch = data
-            for key in batch:
-                log_first_n(logging.INFO, f"key: {key}, len: {len(batch[key])}")
-                if key not in ["gt_node_corr_indices", "gt_node_corr_overlaps"]:
-                    batch[key] = batch[key].cuda()
+            # One "iteration" = one optimizer step. With grad_accum_steps > 1 we run that many
+            # forward/backward passes over consecutive micro-batches and only step once, so the
+            # effective batch size is train_batch_size * grad_accum_steps. This lets a single GPU
+            # reproduce the effective batch size of a multi-GPU run (ported from COG's engine.py).
+            accum_steps = cfg.train.get("grad_accum_steps", 1)
+            for micro_step in range(accum_steps):
+                is_last_micro_step = micro_step == accum_steps - 1
+                data = next(data_loader_iter)
+
+                batch = data
+                for key in batch:
+                    log_first_n(logging.INFO, f"key: {key}, len: {len(batch[key])}")
+                    if key not in ["gt_node_corr_indices", "gt_node_corr_overlaps"]:
+                        batch[key] = batch[key].cuda()
+                    else:
+                        batch[key] = [item.cuda() for item in batch[key]]
+                amp_dtype = torch.bfloat16 if cfg.train.get("amp_dtype", "float16") == "bfloat16" else torch.float16
+                with autocast(dtype=amp_dtype, **cfg.train.amp):
+                    out_dict = model(
+                        batch,
+                    )
+                    dict_info = process_loss(out_dict)
+                    # scale so accumulated grads match a single pass over the full effective batch
+                    loss_all = dict_info["loss"] / accum_steps
+                    assert torch.isfinite(loss_all).all(), loss_all
+
+                    loss_dict = {k: v for k, v in dict_info.items() if "loss" in k and k != "loss"}
+                    loss_dict_reduced = {f"{k}": v.item() for k, v in comm.reduce_dict(loss_dict).items() if "loss" in k}
+                    log_first_n(logging.INFO, f"loss_dict_reduced: {loss_dict_reduced}", n=5)
+                    losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+
+                    non_loss_dict = {k: v for k, v in dict_info.items() if "loss" not in k}
+                    non_loss_dict_reduced = {
+                        f"{k}": v.item() for k, v in comm.reduce_dict(non_loss_dict).items() if "loss" not in k
+                    }
+                    # only log the last micro-batch, so one logged point == one optimizer step
+                    if comm.is_main_process() and is_last_micro_step:
+                        storage.put_scalars(**{f"total_loss": losses_reduced})
+                        storage.put_scalars(**loss_dict_reduced)
+                        # storage.put_scalars(**non_loss_dict_reduced)  # do not print
+                        for k, v in non_loss_dict_reduced.items():
+                            tbx_writer.add_scalar(k, v, iteration)
+
+                if is_last_micro_step:
+                    optim_step(loss_all, model, optimizer, grad_scaler, AMP_ON, clip_grad_cfg=cfg.train.clip_grad)
                 else:
-                    batch[key] = [item.cuda() for item in batch[key]]
-            amp_dtype = torch.bfloat16 if cfg.train.get("amp_dtype", "float16") == "bfloat16" else torch.float16
-            with autocast(dtype=amp_dtype, **cfg.train.amp):
-                out_dict = model(
-                    batch,
-                )
-                dict_info = process_loss(out_dict)
-                loss_all = dict_info["loss"]
-                assert torch.isfinite(loss_all).all(), loss_all
+                    # accumulate gradients only; zero_grad happens inside optim_step on the last step
+                    if AMP_ON:
+                        grad_scaler.scale(loss_all).backward()
+                    else:
+                        loss_all.backward()
 
-                loss_dict = {k: v for k, v in dict_info.items() if "loss" in k and k != "loss"}
-                loss_dict_reduced = {f"{k}": v.item() for k, v in comm.reduce_dict(loss_dict).items() if "loss" in k}
-                log_first_n(logging.INFO, f"loss_dict_reduced: {loss_dict_reduced}", n=5)
-                losses_reduced = sum(loss for loss in loss_dict_reduced.values())
-
-                non_loss_dict = {k: v for k, v in dict_info.items() if "loss" not in k}
-                non_loss_dict_reduced = {
-                    f"{k}": v.item() for k, v in comm.reduce_dict(non_loss_dict).items() if "loss" not in k
-                }
-                if comm.is_main_process():
-                    storage.put_scalars(**{f"total_loss": losses_reduced})
-                    storage.put_scalars(**loss_dict_reduced)
-                    # storage.put_scalars(**non_loss_dict_reduced)  # do not print
-                    for k, v in non_loss_dict_reduced.items():
-                        tbx_writer.add_scalar(k, v, iteration)
-
-            optim_step(loss_all, model, optimizer, grad_scaler, AMP_ON, clip_grad_cfg=cfg.train.clip_grad)
             storage.put_scalar("lr", optimizer.param_groups[0]["lr"], smoothing_hint=False)
             scheduler.step()
 

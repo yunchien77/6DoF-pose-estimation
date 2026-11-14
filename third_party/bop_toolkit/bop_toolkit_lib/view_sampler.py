@@ -238,7 +238,10 @@ def sample_views(
         if pt[2] < 0:
             elev = -elev
 
-        if not (azimuth_range[0] <= azimuth <= azimuth_range[1] and elev_range[0] <= elev <= elev_range[1]):
+        if not (
+            azimuth_range[0] <= azimuth <= azimuth_range[1]
+            and elev_range[0] <= elev <= elev_range[1]
+        ):
             continue
 
         # Rotation matrix.
@@ -289,7 +292,12 @@ def save_vis(path, views, views_level=None):
         ]
 
         normal = R_inv.dot(np.array([0, 0, 1]).reshape((3, 1)))
-        normals += [normal.squeeze(), np.array([0, 0, 0]), np.array([0, 0, 0]), np.array([0, 0, 0])]
+        normals += [
+            normal.squeeze(),
+            np.array([0, 0, 0]),
+            np.array([0, 0, 0]),
+            np.array([0, 0, 0]),
+        ]
 
         if views_level:
             max_level = max(1, max(views_level))
@@ -298,7 +306,12 @@ def save_vis(path, views, views_level=None):
             intens = 255 * view_id / float(len(views))
         colors += [[intens, intens, intens], [255, 0, 0], [0, 255, 0], [0, 0, 255]]
 
-    inout.save_ply2(path, pts=np.array(pts), pts_normals=np.array(normals), pts_colors=np.array(colors))
+    inout.save_ply2(
+        path,
+        pts=np.array(pts),
+        pts_normals=np.array(normals),
+        pts_colors=np.array(colors),
+    )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ import time
 import numpy as np
 import logging
 import orjson as json
+
+from core.unopose.pipelines import hooks
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -78,8 +80,12 @@ def inference_and_save_oneref_v1(
                 # inputs["dense_fo"] = dense_fo[obj].contiguous()
 
                 # make predictions
+                for hook in hooks.before_batch:  # optional per-batch context for the selection hook; empty by default
+                    hook(data, inputs, start_idx, end_idx, data_loader)
                 with torch.no_grad():
                     end_points = model(inputs)
+                for hook in hooks.after_batch:  # optional read-only recorders (the diag recorder); empty by default
+                    hook(data, inputs, end_points, start_idx, end_idx)
                 if "tem1_pose" in data:
                     pose_ref_obj = data["tem1_pose"][0][start_idx:end_idx].contiguous()
                     predpose_tgt_ref = torch.zeros_like(pose_ref_obj)

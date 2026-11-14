@@ -49,3 +49,29 @@ events.out.tfevents*
 /models
 
 #external/*
+
+
+
+*.pth
+*.ckpt
+*.run
+*.zip
+
+checkpoints/
+models/
+
+# raw diagnostic dumps -- multi-hundred-MB to multi-GB per-instance JSON,
+# regenerable by re-running the diagnostic scripts; not meant for version control
+results/matching_diagnostic_*.json
+results/per_obj_ar/
+results/fine_gap_bucket_ar/
+results/cluster_global_consistency_lmo.json
+
+# stripped from history (2026-09-27) for exceeding GitHub's 100MB push limit --
+# re-added here so they can't be accidentally re-committed
+results/rank_gap_diagnostic_ycbv.json
+results/rank_gap_diagnostic_lmo.json
+results/rank_gap_diagnostic_tudl.json
+results/svc_calibration_lmo_easy.pkl
+results/solver_comparison/cfg_svc_calibration_lmo_easy/inference_model_final/lmo/resultPfoneref50_lmo-test_svc_calib.pkl
+results/solver_comparison/cfg_reranker_training_data/logs_20260909_160434/log_20260909_160434.txt

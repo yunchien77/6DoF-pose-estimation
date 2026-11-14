@@ -77,7 +77,9 @@ def save_scene_gt(
     dict mapping image_ids to gt information.
     :param image_camera_tpath: template path with unspecified image_id.
     """
-    _save_scene_dict(scene_gt, image_gt_tpath, lambda lst: [inout._gt_as_json(d) for d in lst])
+    _save_scene_dict(
+        scene_gt, image_gt_tpath, lambda lst: [inout._gt_as_json(d) for d in lst]
+    )
     return
 
 
@@ -117,7 +119,12 @@ def io_load_masks(mask_file, instance_ids=None):
     if instance_ids is None:
         instance_ids = masks_rle.keys()
         instance_ids = sorted(instance_ids)
-    masks = np.stack([pycoco_utils.rle_to_binary_mask(masks_rle[instance_id]) for instance_id in instance_ids])
+    masks = np.stack(
+        [
+            pycoco_utils.rle_to_binary_mask(masks_rle[instance_id])
+            for instance_id in instance_ids
+        ]
+    )
     return masks
 
 

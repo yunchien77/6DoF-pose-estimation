@@ -35,28 +35,42 @@ def convert_scene_to_imagewise(
 
     output_dir.mkdir(exist_ok=True)
 
-    bop_imagewise.save_scene_camera(scene_data["scene_camera"], output_dir / (image_tkey + ".camera.json"))
+    bop_imagewise.save_scene_camera(
+        scene_data["scene_camera"], output_dir / (image_tkey + ".camera.json")
+    )
 
-    bop_imagewise.save_scene_gt(scene_data["scene_gt"], output_dir / (image_tkey + ".gt.json"))
+    bop_imagewise.save_scene_gt(
+        scene_data["scene_gt"], output_dir / (image_tkey + ".gt.json")
+    )
 
-    bop_imagewise.save_scene_gt(scene_data["scene_gt_info"], output_dir / (image_tkey + ".gt_info.json"))
+    bop_imagewise.save_scene_gt(
+        scene_data["scene_gt_info"], output_dir / (image_tkey + ".gt_info.json")
+    )
 
     image_ids = [int(k) for k in scene_data["scene_camera"].keys()]
     for image_id in image_ids:
         image_key = image_tkey.format(image_id=image_id)
         for mask_type in ("mask", "mask_visib"):
             if scene_infos["has_" + mask_type]:
-                masks = bop_scenewise.load_masks(input_scene_dir, image_id, mask_type=mask_type)
-                bop_imagewise.save_masks(masks, output_dir / (image_key + f".{mask_type}.json"))
+                masks = bop_scenewise.load_masks(
+                    input_scene_dir, image_id, mask_type=mask_type
+                )
+                bop_imagewise.save_masks(
+                    masks, output_dir / (image_key + f".{mask_type}.json")
+                )
         for im_modality in (
             "rgb",
             "gray",
             "depth",
         ):
             if scene_infos["has_" + im_modality]:
-                im_path = list((input_scene_dir / im_modality).glob(f"{image_id:06d}.*"))[0]
+                im_path = list(
+                    (input_scene_dir / im_modality).glob(f"{image_id:06d}.*")
+                )[0]
                 suffix = im_path.suffix
-                shutil.copy(im_path, output_dir / (image_key + "." + im_modality + suffix))
+                shutil.copy(
+                    im_path, output_dir / (image_key + "." + im_modality + suffix)
+                )
 
 
 def parse_args():
@@ -112,9 +126,16 @@ def main(args):
 
     if args.nprocs > 0:
         scene_directories = list(scene_directories)
-        image_tkeys = [f"{scene_id:06d}_" + "{image_id:06d}" for scene_id in [int(d.name) for d in scene_directories]]
+        image_tkeys = [
+            f"{scene_id:06d}_" + "{image_id:06d}"
+            for scene_id in [int(d.name) for d in scene_directories]
+        ]
 
-        _args = zip(scene_directories, itertools.repeat(output_dir, len(scene_directories)), image_tkeys)
+        _args = zip(
+            scene_directories,
+            itertools.repeat(output_dir, len(scene_directories)),
+            image_tkeys,
+        )
         with multiprocessing.Pool(processes=args.nprocs) as pool:
             with tqdm.tqdm(total=len(scene_directories)) as pbar:
                 iterator = pool.starmap(convert_scene_to_imagewise, iterable=_args)

@@ -11,6 +11,8 @@ from torch.nn import functional as F
 from functools import partial
 import timm.models.vision_transformer
 
+from core.unopose.model import mv_equiv
+from core.unopose.model.pair_fusion import PairFusion
 from core.unopose.utils.model_utils import (
     LayerNorm2d,
     interpolate_pos_embed,
@@ -40,6 +42,25 @@ class ViT(timm.models.vision_transformer.VisionTransformer):
             if idx in idx_nblock:
                 out.append(self.norm(x))
         return out
+
+    def forward_fused(self, x, fusion, B, S, return_raw=False):
+        """forward on S views per sample stacked sample-major, x (B*S, 3, H, W); `fusion` (PairFusion) lets the views exchange information after each block;
+        return_raw: also return the patch tokens of the last block before the final LayerNorm (B*S, N, C) (what the MV-FM loss is computed on)"""
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.norm_pre(x)
+
+        out = []
+        d = len(self.blocks)
+        n = d // 4
+        idx_nblock = [d - 1, d - n - 1, d - 2 * n - 1, d - 3 * n - 1]
+
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = fusion.fuse(x, idx, self.num_prefix_tokens, B, S)
+            if idx in idx_nblock:
+                out.append(self.norm(x))
+        return (out, x[:, self.num_prefix_tokens:]) if return_raw else out
 
 
 class ViT_AE(nn.Module):
@@ -197,9 +218,58 @@ class ViT_AE(nn.Module):
             for param in self.vit.parameters():
                 param.requires_grad = False
 
+        # optional multiview-equivariance parts (core/unopose/model/mv_equiv.py): LoRA on q / v of the last 4 blocks + refine_conv on the last tapped block
+        mv = cfg.get("mv_equiv", None)
+        self.refine_conv = mv_equiv.install(self.vit, self.embed_dim, int(mv.get("r", 4))) if mv and mv.get("enabled", True) else None
+        # optional pose-free pair fusion (core/unopose/model/pair_fusion.py), built after the freeze so that its adapters and LoRA stay trainable;
+        # built after mv_equiv so that with both on its LoRA wraps the mv_equiv qkv from outside (pair_fusion.LoRAWrap)
+        pf = cfg.get("pair_fusion", None)
+        self.pair_fusion = PairFusion(self.vit, pf) if pf and pf.get("enabled", True) else None
+        # optional ViT-side weights of one arm of the four-ViT retrain (scripts/train/retrain_vit_init.py: vit.* incl. LoRA, refine_conv.*, pair_fusion.*), and freezing them all,
+        # so that only the feature head, the coarse and the fine stage train (docs/experiments/fourarm_retrain_preregistration.md)
+        vinit = cfg.get("vit_side_init", None)
+        if vinit:
+            sd = torch.load(vinit, map_location="cpu", weights_only=True)["params"]
+            own = {k for k in self.state_dict() if k.split(".", 1)[0] in ("vit", "refine_conv", "pair_fusion")}
+            assert set(sd) == own, (sorted(set(sd) - own)[:5], sorted(own - set(sd))[:5])
+            self.load_state_dict(sd, strict=False)
+            logger.info(f"loaded ViT-side weights from: {vinit}")
+        self.freeze_vit_side = bool(cfg.get("freeze_vit_side", False))
+        if self.freeze_vit_side:
+            for mod in self.vit_side():
+                mod.requires_grad_(False)
+        # optional per-layer normalisation of the tapped blocks before the head (docs/experiments/layer_balanced_head_preregistration.md): every patch token of every block
+        # scaled to the same length, so the shallow blocks (length ~100 after the shared final LayerNorm) no longer drown block 11 (~26)
+        self.layer_l2 = cfg.get("layer_l2", None)
+        if self.layer_l2:
+            logger.warning(f"layer_l2 on: every tapped block scaled to length {self.layer_l2} before the head")
+
+    def vit_side(self):
+        return [m for m in (self.vit, self.refine_conv, self.pair_fusion) if m is not None]
+
+    def train(self, mode=True):
+        """frozen ViT side stays in eval mode (no LoRA / adapter dropout), so training sees the same features as testing"""
+        super().train(mode)
+        if self.freeze_vit_side:
+            for m in self.vit_side():
+                m.eval()
+        return self
+
     def forward(self, x):
         B, _, H, W = x.size()
-        vit_outs = self.vit(x)
+        return self.decode(self.vit(x), B, H, W)
+
+    def forward_pair(self, x_a, x_b):
+        """features of two views of the same sample (B, 3, H, W) each, with information exchanged between them inside the ViT -> ((feat_a, cls_a), (feat_b, cls_b))"""
+        assert self.pair_fusion is not None, "forward_pair needs cfg.pair_fusion"
+        B, _, H, W = x_a.size()
+        x = torch.stack([x_a, x_b], dim=1).flatten(0, 1)  # sample-major: index b * 2 + view
+        vit_outs = self.vit.forward_fused(x, self.pair_fusion, B, 2)
+        f, c = self.decode(vit_outs, 2 * B, H, W)
+        f, c = f.reshape(B, 2, *f.shape[1:]), c.reshape(B, 2, -1)
+        return (f[:, 0], c[:, 0]), (f[:, 1], c[:, 1])
+
+    def decode(self, vit_outs, B, H, W):
         # list of [B, token_num, emb_dim]
         cls_tokens = vit_outs[-1][:, 0, :].contiguous()  # [B, emb_dim]
         if "reg4" in self.vit_type:
@@ -207,6 +277,11 @@ class ViT_AE(nn.Module):
             vit_outs = [l[:, 5:, :].contiguous() for l in vit_outs]
         else:
             vit_outs = [l[:, 1:, :].contiguous() for l in vit_outs]
+        if self.refine_conv is not None:
+            vit_outs[-1] = mv_equiv.refine_tokens(self.refine_conv, vit_outs[-1], self.patch_num_side)
+
+        if self.layer_l2:
+            vit_outs = [F.normalize(l, dim=-1) * float(self.layer_l2) for l in vit_outs]
 
         if self.use_pyramid_feat:
             x = torch.cat(vit_outs, dim=2)
@@ -241,11 +316,18 @@ class ViTEncoderOneRef(nn.Module):
         super(ViTEncoderOneRef, self).__init__()
         self.npoint = npoint
         self.rgb_net = ViT_AE(cfg)
+        self.pair_fusion = self.rgb_net.pair_fusion is not None
 
     def forward(self, end_points):
         rgb = end_points["rgb"]
         rgb_choose = end_points["rgb_choose"]
-        dense_fm = self.get_img_feats(rgb, rgb_choose)
+        if self.pair_fusion:
+            # query and reference crop go through the ViT together; the reference features then depend on the query, so cached ones (dense_po / dense_fo) cannot be used
+            assert "dense_po" not in end_points, "pair fusion cannot use cached reference features"
+            (fm_map, _), (fo_map, _) = self.rgb_net.forward_pair(rgb, end_points["tem1_rgb"])
+            dense_fm = get_chosen_pixel_feats(fm_map, rgb_choose)
+        else:
+            dense_fm = self.get_img_feats(rgb, rgb_choose)
         dense_pm = end_points["pts"]
         assert rgb_choose.size(1) == self.npoint
 
@@ -276,7 +358,10 @@ class ViTEncoderOneRef(nn.Module):
             dense_pm = dense_pm / (radius.reshape(-1, 1, 1) + 1e-6)
             tem1_pts = tem1_pts / (radius.reshape(-1, 1, 1) + 1e-6)
 
-            dense_po, dense_fo = self.get_obj_feats([tem1_rgb], [tem1_pts], [tem1_choose])
+            if self.pair_fusion:
+                dense_po, dense_fo = sample_pts_feats(tem1_pts, get_chosen_pixel_feats(fo_map, tem1_choose), self.npoint)
+            else:
+                dense_po, dense_fo = self.get_obj_feats([tem1_rgb], [tem1_pts], [tem1_choose])
         # target(observed), src (ref/template/obj)
         # [b, p, 3]; [b, p, c]
         return dense_pm, dense_fm, dense_po, dense_fo, radius

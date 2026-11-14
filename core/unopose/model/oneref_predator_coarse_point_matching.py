@@ -9,6 +9,7 @@ from core.unopose.utils.model_utils import (
     compute_coarse_Rt_overlap,
 )
 from core.unopose.utils.loss_utils import compute_overlap_loss, compute_soft_loss
+from core.unopose.pipelines import hooks
 
 
 class CoarsePointMatchingOneRef(nn.Module):
@@ -78,7 +79,7 @@ class CoarsePointMatchingOneRef(nn.Module):
         if self.training:
             gt_R = end_points["rotation_label"]
             gt_t = end_points["translation_label"] / (radius.reshape(-1, 1) + 1e-6)
-            init_R, init_t = aug_pose_noise(gt_R, gt_t)
+            init_R, init_t = aug_pose_noise(gt_R, gt_t, wide=self.cfg.get("init_noise_wide", None))   # None = the original noise
 
             end_points = compute_overlap_loss(
                 end_points,
@@ -96,6 +97,10 @@ class CoarsePointMatchingOneRef(nn.Module):
             if self.cfg.get("softloss_weight", 0.0) > 0:
                 end_points = compute_soft_loss(end_points, atten_list, p1, p2, gt_R, gt_t, loss_str="coarse_soft")
         else:
+            hooks.state["radius"] = radius.detach().float().reshape(-1)  # context for the optional selection hook
+            if "coarse_feats" in hooks.state:                            # rotation head (pipelines/select_rothead.py): last-block features and points, background token dropped
+                hooks.state["coarse_feats"] = (f1[:, 1:], p1, f2[:, 1:], p2)
+                hooks.state["coarse_inputs"] = ({k: end_points[k] for k in ("rgb", "rgb_choose", "pts", "tem1_rgb", "tem1_choose", "tem1_pts")}, radius)
             init_R, init_t, init_score = compute_coarse_Rt_overlap(
                 atten_list[-1],
                 score_list[-1],

@@ -5,11 +5,7 @@
 import datetime
 import numpy as np
 import datetime
-import time
-from collections import defaultdict
-import copy
 from skimage import measure
-from itertools import groupby
 from bop_toolkit_lib import misc
 
 
@@ -35,7 +31,14 @@ def create_image_info(image_id, file_name, image_size):
 
 
 def create_annotation_info(
-    annotation_id, image_id, object_id, binary_mask, bounding_box, mask_encoding_format="rle", tolerance=2, ignore=None
+    annotation_id,
+    image_id,
+    object_id,
+    binary_mask,
+    bounding_box,
+    mask_encoding_format="rle",
+    tolerance=2,
+    ignore=None,
 ):
     """Creates info section of coco annotation
 
@@ -111,14 +114,24 @@ def merge_coco_annotations(existing_coco_annotations, new_coco_annotations):
             existing_coco_annotations["categories"].append(cat_dict)
 
     # Concatenate images sections
-    image_id_offset = max([image["id"] for image in existing_coco_annotations["images"]]) + 1
+    image_id_offset = (
+        max([image["id"] for image in existing_coco_annotations["images"]]) + 1
+    )
     for image in new_coco_annotations["images"]:
         image["id"] += image_id_offset
     existing_coco_annotations["images"].extend(new_coco_annotations["images"])
 
     # Concatenate annotations sections
     if len(existing_coco_annotations["annotations"]) > 0:
-        annotation_id_offset = max([annotation["id"] for annotation in existing_coco_annotations["annotations"]]) + 1
+        annotation_id_offset = (
+            max(
+                [
+                    annotation["id"]
+                    for annotation in existing_coco_annotations["annotations"]
+                ]
+            )
+            + 1
+        )
     else:
         annotation_id_offset = 0
     for annotation in new_coco_annotations["annotations"]:
@@ -169,7 +182,9 @@ def binary_mask_to_polygon(binary_mask, tolerance=0):
     """
     polygons = []
     # pad mask to close contours of shapes which start and end at an edge
-    padded_binary_mask = np.pad(binary_mask, pad_width=1, mode="constant", constant_values=0)
+    padded_binary_mask = np.pad(
+        binary_mask, pad_width=1, mode="constant", constant_values=0
+    )
     contours = np.array(measure.find_contours(padded_binary_mask, 0.5))
     # Reverse padding
     contours = contours - 1
@@ -258,6 +273,51 @@ def compute_ious(gt, dt, iou_type):
         gt_bin = np.array([rle_to_binary_mask(g["segmentation"]) for g in gt])
         dt_bin = np.array([rle_to_binary_mask(d["segmentation"]) for d in dt])
         intersections = np.einsum("ijk,ljk->il", dt_bin, gt_bin)
-        unions = np.sum((np.expand_dims(dt_bin, 1) + np.expand_dims(gt_bin, 0)) > 0, axis=(2, 3))
+        unions = np.sum(
+            (np.expand_dims(dt_bin, 1) + np.expand_dims(gt_bin, 0)) > 0, axis=(2, 3)
+        )
         ious = intersections / unions
     return ious
+
+
+def ensure_rle_binary(dataset_coco_results, cocoGt):
+    """
+    Ensure that all segmentation annotations are in binary RLE format.
+
+    This is required by pycocotools only in the case that a "bbox" annotation
+    is not provided along the segmentation.
+
+    :param dataset_coco_results: coco results, will be modified in place
+    :param cocoGt: pycocotools.coco.COCO object containing the ground-truth annotation
+    """
+
+    for ann in dataset_coco_results:
+        if 'bbox' not in ann:
+            t = cocoGt.imgs[ann['image_id']]
+            ann["segmentation"] = annotation_to_binary_rle(ann, t['height'], t['width'])
+
+
+def annotation_to_binary_rle(ann, h, w):
+    """
+    Convert annotation which can be polygons, uncompressed RLE to RLE.
+
+    :param ann: detection annotation containing a "segmentation" and "size" key
+    :param h: image height
+    :param w: image width
+    :return: binary mask (numpy 2D array)
+    """
+    from pycocotools import mask as maskUtils
+
+    segm = ann['segmentation']
+    if type(segm) == list:
+        # polygon -- a single object might consist of multiple parts
+        # we merge all parts into one mask rle code
+        rles = maskUtils.frPyObjects(segm, h, w)
+        rle = maskUtils.merge(rles)
+    elif type(segm['counts']) == list:
+        # uncompressed RLE
+        rle = maskUtils.frPyObjects(segm, h, w)
+    else:
+        # rle
+        rle = ann['segmentation']
+    return rle

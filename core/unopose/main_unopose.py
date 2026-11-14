@@ -107,6 +107,10 @@ def main(args):
     model = instantiate(cfg.model)
     logger.info("Model:\n{}".format(model))
     model.to(cfg.train.device)
+    reserve_gb = cfg.train.get("reserve_gpu_gb", 0)
+    if reserve_gb:  # take this much GPU memory into PyTorch's cache up front (never released), so other jobs on the card cannot take it later
+        torch.empty(int(reserve_gb * 2**30), dtype=torch.uint8, device=cfg.train.device)
+        logger.info(f"reserved {reserve_gb} GB of GPU memory in the caching allocator")
 
     if True:
         params_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / (1024 * 1024)
@@ -141,6 +145,8 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
 
     do_train(cfg, args, model, optimizer, resume=args.resume)
+    if cfg.train.get("skip_final_test", False):  # scripts/queue/retrain_arm.sh: evaluated afterwards with the full pipeline (scripts/queue/retrain_eval.sh)
+        return
     # return do_test(cfg, model)
     if isinstance(model, (torch.nn.DataParallel, DistributedDataParallel)):
         return do_save_results(cfg, model.module)

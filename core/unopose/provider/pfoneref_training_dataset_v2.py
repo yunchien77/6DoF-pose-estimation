@@ -112,31 +112,12 @@ class DatasetPoseFreeOneRefv2:
             osp.join(self.data_dir, "megapose_shapenetcore_fixed_valid_inst_ids.json"),
         ]
 
-        self.dataset_paths = []
-        for f in self.data_paths:
-            key_shards = load_json(osp.join(self.data_dir, f, "key_to_shard.json"))
-            for k in tqdm(key_shards.keys()):
-                # path_name = osp.join(f, "shard-" + f"{key_shards[k]:06d}", k)
-                path_name = osp.join(f, f"{key_shards[k]:06d}", k)
-                self.dataset_paths.append(path_name)
-        self.length = len(self.dataset_paths)
-        logger.info("Total {} images .....".format(self.length))
-
-        # load reference informations
-        self.templates_infos = {}
-        self.templates_infos["GSO"] = load_json(self.templates_paths[0])
-        self.templates_infos["ShapeNetCore"] = load_json(self.templates_paths[1])
-        logger.info("loaded templates infos")
-
-        self.model_info = [load_json(osp.join(self.data_dir, self.data_paths[0], "gso_models.json"))]
-
-        self.model_info.append(load_json(osp.join(self.data_dir, self.data_paths[1], "shapenet_models.json")))
-
-        # load valid insts
-        self.valid_insts = {}
-        self.valid_insts["GSO"] = load_json(self.valid_insts_paths[0])
-        self.valid_insts["ShapeNetCore"] = load_json(self.valid_insts_paths[1])
-        logger.info("loaded valid insts")
+        cache = self._index_cache_path()
+        if osp.exists(cache):  # compact index built earlier for the same data: skip the ~4 GB json path
+            self._load_index(cache)
+        else:
+            self._build_index()
+            self._save_index(cache)
 
         # gdrnpp aug
         aug_code = (
@@ -163,6 +144,158 @@ class DatasetPoseFreeOneRefv2:
             [transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
         )
 
+    def _build_index(self):
+        self.dataset_paths = []
+        self.available_shards = {}  # dataset_type -> set of locally downloaded shard ids
+        for f in self.data_paths:
+            key_shards = load_json(osp.join(self.data_dir, f, "key_to_shard.json"))
+            # only keep entries whose shard is actually present locally, so we don't
+            # waste retries re-sampling shards that were never downloaded
+            local_shard_dir = osp.join(self.data_dir, f)
+            available_shards = {int(d) for d in os.listdir(local_shard_dir) if d.isdigit()}
+            self.available_shards[f.split("/")[0][9:]] = available_shards  # "GSO" / "ShapeNetCore"
+            for k in tqdm(key_shards.keys()):
+                shard_id = key_shards[k]
+                if shard_id not in available_shards:
+                    continue
+                # path_name = osp.join(f, "shard-" + f"{key_shards[k]:06d}", k)
+                path_name = osp.join(f, f"{shard_id:06d}", k)
+                self.dataset_paths.append(path_name)
+
+        # optionally restrict to a fixed-seed random subset representing X% of the FULL
+        # original dataset (2,008,971 images), drawn from whatever is currently downloaded.
+        # Works no matter how much (or how little, or in what order) has been downloaded so
+        # far - it always samples `int(2008971 * subset_fraction)` images, so re-running with
+        # the same subset_fraction/subset_seed later (after downloading more shards) is still
+        # comparable as long as the earlier subset stayed a subset of the later pool.
+        # (ported from COG's core/COG/provider/pfoneref_training_dataset_v2.py)
+        subset_fraction = self.cfg.get("subset_fraction", None)
+        if subset_fraction is not None:
+            FULL_DATASET_LEN = 2008971  # size of the complete MegaPose GSO+ShapeNetCore train set
+            subset_seed = self.cfg.get("subset_seed", 42)
+            target_n = int(FULL_DATASET_LEN * subset_fraction)
+            if target_n < len(self.dataset_paths):
+                rng = np.random.RandomState(subset_seed)
+                chosen = np.sort(rng.choice(len(self.dataset_paths), size=target_n, replace=False))
+                self.dataset_paths = [self.dataset_paths[i] for i in chosen]
+                logger.info(
+                    f"subset_fraction={subset_fraction} (seed={subset_seed}): "
+                    f"using {target_n} / {FULL_DATASET_LEN} images (fixed random subset)"
+                )
+            else:
+                logger.warning(
+                    f"subset_fraction={subset_fraction} needs {target_n} images, "
+                    f"but only {len(self.dataset_paths)} are downloaded locally; using all of them"
+                )
+
+        self.length = len(self.dataset_paths)
+        logger.info("Total {} images .....".format(self.length))
+
+        # load reference informations
+        self.templates_infos = {}
+        self.templates_infos["GSO"] = load_json(self.templates_paths[0])
+        self.templates_infos["ShapeNetCore"] = load_json(self.templates_paths[1])
+        # same fix as dataset_paths above: reference templates also point at shard ids
+        # across the full dataset, so filter out ones we haven't downloaded locally
+        for dataset_type, shards in self.available_shards.items():
+            for obj_id, tem_list in self.templates_infos[dataset_type].items():
+                self.templates_infos[dataset_type][obj_id] = [
+                    tem_info for tem_info in tem_list if tem_info[0] in shards
+                ]
+        logger.info("loaded templates infos")
+
+        self.model_info = [load_json(osp.join(self.data_dir, self.data_paths[0], "gso_models.json"))]
+
+        self.model_info.append(load_json(osp.join(self.data_dir, self.data_paths[1], "shapenet_models.json")))
+
+        # load valid insts
+        self.valid_insts = {}
+        self.valid_insts["GSO"] = load_json(self.valid_insts_paths[0])
+        self.valid_insts["ShapeNetCore"] = load_json(self.valid_insts_paths[1])
+        logger.info("loaded valid insts")
+        self._compact_index()
+
+    def _index_cache_path(self):
+        """Cache file for the compact index, keyed by the local shards, the index json files and the subset setting."""
+        import hashlib
+        import json
+
+        parts = [sorted(int(d) for d in os.listdir(osp.join(self.data_dir, f)) if d.isdigit()) for f in self.data_paths]
+        for path in self.templates_paths + self.valid_insts_paths + [osp.join(self.data_dir, f, "key_to_shard.json") for f in self.data_paths]:
+            st = os.stat(path)
+            parts.append([osp.realpath(path), st.st_size, int(st.st_mtime)])
+        parts.append([self.cfg.get("subset_fraction", None), self.cfg.get("subset_seed", 42)])
+        h = hashlib.md5(json.dumps(parts).encode()).hexdigest()[:16]
+        return osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), "../../../output/cache/megapose_index", f"{h}.npz"))
+
+    def _save_index(self, cache):
+        arrays = {"dataset_paths": self.dataset_paths, "valid_offsets": self.valid_offsets, "valid_flat": self.valid_flat}
+        for t, rng in self.tem_range.items():
+            arrays[f"{t}.obj"] = np.asarray(list(rng.keys()), dtype=np.bytes_)
+            arrays[f"{t}.range"] = np.asarray(list(rng.values()), dtype=np.int64).reshape(-1, 2)
+            arrays[f"{t}.shard"], arrays[f"{t}.key"], arrays[f"{t}.inst"] = self.tem_shard[t], self.tem_key[t], self.tem_inst[t]
+        os.makedirs(osp.dirname(cache), exist_ok=True)
+        tmp = f"{cache}.{os.getpid()}.tmp.npz"
+        np.savez(tmp, **arrays)
+        os.replace(tmp, cache)  # atomic: ranks starting together may both write
+        logger.info(f"saved compact sample index to {cache}")
+
+    def _load_index(self, cache):
+        z = np.load(cache, allow_pickle=False)
+        self.dataset_paths, self.valid_offsets, self.valid_flat = z["dataset_paths"], z["valid_offsets"], z["valid_flat"]
+        self.tem_range, self.tem_shard, self.tem_key, self.tem_inst = {}, {}, {}, {}
+        for t in ("GSO", "ShapeNetCore"):
+            self.tem_range[t] = {o.decode(): (int(a), int(b)) for o, (a, b) in zip(z[f"{t}.obj"], z[f"{t}.range"])}
+            self.tem_shard[t], self.tem_key[t], self.tem_inst[t] = z[f"{t}.shard"], z[f"{t}.key"], z[f"{t}.inst"]
+        self.length = len(self.dataset_paths)
+        self.model_info = [load_json(osp.join(self.data_dir, self.data_paths[0], "gso_models.json"))]
+        self.model_info.append(load_json(osp.join(self.data_dir, self.data_paths[1], "shapenet_models.json")))
+        logger.info(f"Total {self.length} images ..... (compact index from {cache})")
+
+    def _compact_index(self):
+        """Store the sample index as flat numpy arrays instead of millions of small Python objects.
+
+        As lists/dicts (~16.7M template entries, 2M paths) the index takes ~4 GB per process, and every
+        dataloader worker slowly copies all of it (refcount writes and the cyclic GC touch every object's page,
+        breaking fork's copy-on-write), so 2 ranks x 8 workers ran the host out of RAM. Numpy arrays hold no
+        per-entry objects and stay shared. Same entries, same order, same RNG calls as before.
+        """
+        paths = self.dataset_paths
+        valid_counts = np.zeros(len(paths), dtype=np.int64)
+        valid_flat = []
+        for i, path_head in enumerate(paths):  # valid instances aligned to dataset index (was keyed by "shard/key")
+            dataset_type = path_head.split("/")[0][9:]
+            shard_name, key_name = path_head.split("/")[-2:]
+            v = self.valid_insts[dataset_type].get(f"{shard_name}/{key_name}", [])
+            valid_counts[i] = len(v)
+            valid_flat.extend(v)
+        self.valid_offsets = np.concatenate([[0], np.cumsum(valid_counts)])
+        self.valid_flat = np.asarray(valid_flat, dtype=np.int64)
+        self.dataset_paths = np.asarray(paths, dtype=np.bytes_)
+        del paths, valid_flat, self.valid_insts
+
+        # templates: per dataset type, obj_id -> (start, end) into flat shard / key / inst arrays
+        self.tem_range, self.tem_shard, self.tem_key, self.tem_inst = {}, {}, {}, {}
+        for dataset_type, infos in self.templates_infos.items():
+            rng, shard, key, inst, n = {}, [], [], [], 0
+            for obj_id, tem_list in infos.items():
+                rng[obj_id] = (n, n + len(tem_list))
+                n += len(tem_list)
+                for s, k, j in tem_list:
+                    shard.append(s)
+                    key.append(k)
+                    inst.append(j)
+            self.tem_range[dataset_type] = rng
+            self.tem_shard[dataset_type] = np.asarray(shard, dtype=np.int64)
+            self.tem_key[dataset_type] = np.asarray(key, dtype=np.bytes_)
+            self.tem_inst[dataset_type] = np.asarray(inst, dtype=np.int64)
+            del shard, key, inst
+        del self.templates_infos
+        import gc
+
+        gc.collect()
+        logger.info("compacted sample index")
+
     def __len__(self):
         return self.length if self.num_img_per_epoch == -1 else self.num_img_per_epoch
 
@@ -178,9 +311,14 @@ class DatasetPoseFreeOneRefv2:
 
     def __getitem__(self, index):
         while True:  # return valid data for train
-            processed_data = self.read_data(self.img_idx[index])
-            if processed_data is None:
-                logger.warning(f"processed_data {self.img_idx[index]} is None, rand another")
+            try:
+                processed_data = self.read_data(self.img_idx[index])
+                if processed_data is None:
+                    raise Exception("processed data is None")
+            except Exception as e:
+                # e.g. reference template points to a shard we haven't downloaded
+                # (only relevant when training on a partial/subset dataset)
+                logger.warning(f"read data exception: {e}, rand another")
                 index = self._rand_another(index)
                 continue
             return processed_data
@@ -190,7 +328,7 @@ class DatasetPoseFreeOneRefv2:
         return np.random.choice(pool)
 
     def read_data(self, index):
-        path_head = self.dataset_paths[index]  # e.g.: 'MegaPose-GSO/train_pbr_web/000126/002342_000028'
+        path_head = self.dataset_paths[index].decode()  # e.g.: 'MegaPose-GSO/train_pbr_web/000126/002342_000028'
         dataset_type = path_head.split("/")[0][9:]  # MegaPose-GSO/  MegaPose-ShapeNetCore --> GSO, ShapeNetCore
         if not self._check_path(osp.join(self.data_dir, path_head)):
             logger.warning("check path failed!")
@@ -198,7 +336,7 @@ class DatasetPoseFreeOneRefv2:
 
         # valid_idx = load_json(osp.join(self.data_dir, path_head + ".valid_insts.json"))
         shard_name, key_name = path_head.split("/")[-2:]
-        valid_idx = self.valid_insts[dataset_type].get(f"{shard_name}/{key_name}", [])
+        valid_idx = [int(v) for v in self.valid_flat[self.valid_offsets[index] : self.valid_offsets[index + 1]]]
 
         if len(valid_idx) == 0:
             logger.warning("no valid instance!")
@@ -218,7 +356,8 @@ class DatasetPoseFreeOneRefv2:
         obj_id = gt["obj_id"]
         # if no reference can be found, return None
         # import ipdb; ipdb.set_trace()
-        assert len(self.templates_infos[dataset_type][str(obj_id)]) != 0
+        s, e = self.tem_range[dataset_type][str(obj_id)]
+        assert e - s != 0
 
         target_R = np.array(gt["cam_R_m2c"]).reshape(3, 3).astype(np.float32)
         target_t = np.array(gt["cam_t_m2c"]).reshape(3).astype(np.float32) / 1000.0
@@ -393,12 +532,16 @@ class DatasetPoseFreeOneRefv2:
         #     assert info["obj_id"] == obj_id
         # else:
         #     raise ValueError("Unknown dataset_type: {}".format(dataset_type))
-        tem_list = self.templates_infos[dataset_type][str(obj_id)]
-        if len(tem_list) == 0:
+        s, e = self.tem_range[dataset_type][str(obj_id)]
+        if e - s == 0:
             return None, None, None, None
-        tem_indices = [i for i in range(len(tem_list))]
-        tem_idx = np.random.choice(tem_indices)
-        tem_info = tem_list[tem_idx]
+        tem_indices = [i for i in range(e - s)]
+        tem_idx = s + np.random.choice(tem_indices)
+        tem_info = (
+            int(self.tem_shard[dataset_type][tem_idx]),
+            self.tem_key[dataset_type][tem_idx].decode(),
+            int(self.tem_inst[dataset_type][tem_idx]),
+        )
         if dataset_type == "GSO":
             dir_idx = 0
         elif dataset_type == "ShapeNetCore":

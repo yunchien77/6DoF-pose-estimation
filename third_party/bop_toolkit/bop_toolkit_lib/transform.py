@@ -332,7 +332,11 @@ def rotation_matrix(angle, direction, point=None):
     R += numpy.outer(direction, direction) * (1.0 - cosa)
     direction *= sina
     R += numpy.array(
-        [[0.0, -direction[2], direction[1]], [direction[2], 0.0, -direction[0]], [-direction[1], direction[0], 0.0]]
+        [
+            [0.0, -direction[2], direction[1]],
+            [direction[2], 0.0, -direction[0]],
+            [-direction[1], direction[0], 0.0],
+        ]
     )
     M = numpy.identity(4)
     M[:3, :3] = R
@@ -807,7 +811,9 @@ def decompose_matrix(matrix):
     return scale, shear, angles, translate, perspective
 
 
-def compose_matrix(scale=None, shear=None, angles=None, translate=None, perspective=None):
+def compose_matrix(
+    scale=None, shear=None, angles=None, translate=None, perspective=None
+):
     """Return transformation matrix from sequence of transformations.
 
     This is the inverse of the decompose_matrix function.
@@ -1500,7 +1506,9 @@ def random_quaternion(rand=None):
     pi2 = math.pi * 2.0
     t1 = pi2 * rand[1]
     t2 = pi2 * rand[2]
-    return numpy.array([numpy.cos(t2) * r2, numpy.sin(t1) * r1, numpy.cos(t1) * r1, numpy.sin(t2) * r2])
+    return numpy.array(
+        [numpy.cos(t2) * r2, numpy.sin(t1) * r1, numpy.cos(t1) * r1, numpy.sin(t2) * r2]
+    )
 
 
 def random_rotation_matrix(rand=None):

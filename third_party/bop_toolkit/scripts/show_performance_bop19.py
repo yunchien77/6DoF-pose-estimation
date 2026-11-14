@@ -39,20 +39,30 @@ p = {
             "vsd_taus": list(np.arange(0.05, 0.51, 0.05)),
             "correct_th": [[th] for th in np.arange(0.05, 0.51, 0.05)],
         },
-        {"n_top": -1, "type": "mssd", "correct_th": [[th] for th in np.arange(0.05, 0.51, 0.05)]},
-        {"n_top": -1, "type": "mspd", "correct_th": [[th] for th in np.arange(5, 51, 5)]},
+        {
+            "n_top": -1,
+            "type": "mssd",
+            "correct_th": [[th] for th in np.arange(0.05, 0.51, 0.05)],
+        },
+        {
+            "n_top": -1,
+            "type": "mspd",
+            "correct_th": [[th] for th in np.arange(5, 51, 5)],
+        },
     ],
     # Minimum visible surface fraction of a valid GT pose.
-    "visib_gt_min": 0.1,
+    "visib_gt_min": -1,
     # Plot Recall curves
     "plot_recall_curves": True,
     # Names of files with results for which to calculate the errors (assumed to be
-    # stored in folder config.eval_path). See docs/bop_challenge_2019.md for a
+    # stored in folder p['results_path']). See docs/bop_challenge_2019.md for a
     # description of the format. Example results can be found at:
     # https://bop.felk.cvut.cz/media/data/bop_sample_results/bop_challenge_2019_sample_results.zip
     "result_filenames": [
         "/path/to/csv/with/results",
     ],
+    # Folder for the calculated pose errors and performance scores.
+    "eval_path": config.eval_path,
 }
 ################################################################################
 
@@ -62,7 +72,14 @@ p = {
 parser = argparse.ArgumentParser()
 parser.add_argument("--visib_gt_min", default=p["visib_gt_min"])
 parser.add_argument(
-    "--result_filenames", default=",".join(p["result_filenames"]), help="Comma-separated names of files with results."
+    "--result_filenames",
+    default=",".join(p["result_filenames"]),
+    help="Comma-separated names of files with results.",
+)
+parser.add_argument(
+    "--eval_path",
+    default=p["eval_path"],
+    help="Comma-separated names of files with results.",
 )
 args = parser.parse_args()
 
@@ -107,10 +124,14 @@ def plot_recall_curves(recall_dict, p):
         else:
             plt.xlabel("thres @ object diameter")
 
-        plt.title(error["type"] + " - " + "average recall: " + "{:.4f}".format(np.mean(all_recalls)))
+        plt.title(
+            error["type"]
+            + " - "
+            + "average recall: "
+            + "{:.4f}".format(np.mean(all_recalls))
+        )
 
     plt.show()
-
 
 for result_filename in p["result_filenames"]:
     misc.log("===========")
@@ -124,8 +145,7 @@ for result_filename in p["result_filenames"]:
 
     for error in p["errors"]:
         # Name of the result and the dataset.
-        result_name = os.path.splitext(os.path.basename(result_filename))[0]
-        dataset = str(result_name.split("_")[1].split("-")[0])
+        result_name, _, dataset, _, _, _ = inout.parse_result_filename(result_filename)
 
         # Paths (rel. to config.eval_path) to folders with calculated pose errors.
         # For VSD, there is one path for each setting of tau. For the other pose
@@ -134,12 +154,15 @@ for result_filename in p["result_filenames"]:
         if error["type"] == "vsd":
             for vsd_tau in error["vsd_taus"]:
                 error_sign = misc.get_error_signature(
-                    error["type"], error["n_top"], vsd_delta=error["vsd_deltas"][dataset], vsd_tau=vsd_tau
+                    error["type"],
+                    error["n_top"],
+                    vsd_delta=error["vsd_deltas"][dataset],
+                    vsd_tau=vsd_tau,
                 )
-                error_dir_paths[error_sign] = os.path.join(result_name, error_sign)
+                error_dir_paths[error_sign] = os.path.join(args.eval_path, result_name, error_sign)
         else:
             error_sign = misc.get_error_signature(error["type"], error["n_top"])
-            error_dir_paths[error_sign] = os.path.join(result_name, error_sign)
+            error_dir_paths[error_sign] = os.path.join(args.eval_path, result_name, error_sign)
 
         # Recall scores for all settings of the threshold of correctness (and also
         # of the misalignment tolerance tau in the case of VSD).
@@ -153,7 +176,9 @@ for result_filename in p["result_filenames"]:
                 score_sign = misc.get_score_signature(correct_th, p["visib_gt_min"])
 
                 scores_filename = "scores_{}.json".format(score_sign)
-                scores_path = os.path.join(config.eval_path, result_name, error_sign, scores_filename)
+                scores_path = os.path.join(
+                    args.eval_path, result_name, error_sign, scores_filename
+                )
 
                 # Load the scores.
                 misc.log("Loading calculated scores from: {}".format(scores_path))

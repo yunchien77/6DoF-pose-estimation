@@ -6,6 +6,8 @@ import numpy as np
 from torch.cuda.amp import autocast
 from einops import rearrange
 
+from core.unopose.pipelines import hooks
+
 from core.unopose.model.pointnet2.pointnet2_utils import (
     gather_operation,
     furthest_point_sample,
@@ -282,7 +284,8 @@ def compute_feature_similarity(feat1, feat2, type="cosine", temp=1.0, normalize_
     return atten_mat
 
 
-def aug_pose_noise(gt_r, gt_t, std_rots=[15, 10, 5, 1.25, 1], max_rot=45, sel_std_trans=[0.2, 0.2, 0.2], max_trans=0.8):
+def aug_pose_noise(gt_r, gt_t, std_rots=[15, 10, 5, 1.25, 1], max_rot=45, sel_std_trans=[0.2, 0.2, 0.2], max_trans=0.8, wide=None):
+    """`wide` (default None = unchanged): dict(p, max_deg); a share p of the samples gets a rotation about a random axis by an angle uniform in [0, max_deg] instead of the Euler noise (docs/experiments/wide_basin_preregistration.md)"""
     B = gt_r.size(0)
     device = gt_r.device
 
@@ -319,6 +322,17 @@ def aug_pose_noise(gt_r, gt_t, std_rots=[15, 10, 5, 1.25, 1], max_rot=45, sel_st
         dim=1,
     )
     rand_rot = a1 @ a2 @ a3
+
+    if wide is not None:
+        axis = torch.randn(B, 3, device=device)
+        axis = axis / axis.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        theta = torch.rand(B, device=device) * float(wide["max_deg"]) * np.pi / 180.0
+        K = torch.zeros(B, 3, 3, device=device)
+        K[:, 0, 1], K[:, 0, 2], K[:, 1, 0], K[:, 1, 2], K[:, 2, 0], K[:, 2, 1] = -axis[:, 2], axis[:, 1], axis[:, 2], -axis[:, 0], -axis[:, 1], axis[:, 0]
+        eye = torch.eye(3, device=device).expand(B, 3, 3)
+        R_wide = eye + torch.sin(theta).view(B, 1, 1) * K + (1 - torch.cos(theta)).view(B, 1, 1) * (K @ K)
+        use = (torch.rand(B, device=device) < float(wide["p"])).view(B, 1, 1)
+        rand_rot = torch.where(use, R_wide.to(rand_rot.dtype), rand_rot)
 
     rand_trans = torch.normal(
         mean=torch.zeros([B, 3]).to(device),
@@ -437,7 +451,12 @@ def compute_coarse_Rt_overlap(
     pts2 = pts2.float()
     model_pts = model_pts.float()
     score1 = score[:, :N1].float()
-    score2 = score[:, N2:].float()
+    # `score` is [s1 (N1) | s2 (N2)]; the second half starts at N1, not N2.
+    # Equivalent today only because coarse_npoint makes N1 == N2 -- with
+    # N1 != N2 the old form yielded a length-N1 slice and the downstream
+    # repeat/multiply raised a shape error. See compute_fine_Rt_overlap below,
+    # which already had this right.
+    score2 = score[:, N1:].float()
 
     expand_model_pts = model_pts.unsqueeze(1).repeat(1, n_proposal2, 1, 1).reshape(B * n_proposal2, -1, 3)
     expand_dim = torch.ones((B, 1), device=device)
@@ -454,6 +473,8 @@ def compute_coarse_Rt_overlap(
 
     pred_score = pred_score[:, 1:, 1:].contiguous()
     pred_score = pred_score * weights1.unsqueeze(2) * weights2.unsqueeze(1)
+    if hooks.select is not None:  # context for the optional recorders (core/unopose/pipelines/hypdump.py); off by default
+        hooks.state["corr"], hooks.state["pts1"] = pred_score, pts1
     pred_score = pred_score.reshape(B, N1 * N2) ** 1.5
 
     # sample pose hypothese
@@ -473,7 +494,10 @@ def compute_coarse_Rt_overlap(
     p1 = p1.reshape(B, n_proposal1, 3, 3)
     p2 = p2.reshape(B, n_proposal1, 3, 3)
     dis = torch.norm((p1 - pred_ts) @ pred_rs - p2, dim=3).mean(2)
-    idx = torch.topk(dis, n_proposal2, dim=1, largest=False)[1]
+    if hooks.guide is not None:  # optional proposal-pool guidance (core/unopose/pipelines/select_gpool.py); off by default
+        idx = hooks.guide(dis, pred_rs, n_proposal2)
+    else:
+        idx = torch.topk(dis, n_proposal2, dim=1, largest=False)[1]
     pred_rs = torch.gather(pred_rs, 1, idx.reshape(B, n_proposal2, 1, 1).repeat(1, 1, 3, 3))
     pred_ts = torch.gather(pred_ts, 1, idx.reshape(B, n_proposal2, 1, 1).repeat(1, 1, 1, 3))
 
@@ -484,6 +508,9 @@ def compute_coarse_Rt_overlap(
     dis = dis.min(2)[0].reshape(B, n_proposal2, -1)
     scores = weights1.unsqueeze(1).sum(2) / ((dis * weights1.unsqueeze(1)).sum(2) + +1e-8)
     pose_score, idx = scores.max(1)
+    if hooks.select is not None:  # optional selection hook (core/unopose/pipelines/hooks.py); off by default
+        idx = hooks.select(idx, scores, pred_rs, pred_ts, model_pts)
+        pose_score = scores.gather(1, idx[:, None]).squeeze(1)
     pred_R = torch.gather(pred_rs, 1, idx.reshape(B, 1, 1, 1).repeat(1, 1, 3, 3)).squeeze(1)
     pred_t = torch.gather(pred_ts, 1, idx.reshape(B, 1, 1, 1).repeat(1, 1, 1, 3)).squeeze(2).squeeze(1)
     # no grad, coarse svd is not differentiable
@@ -524,10 +551,55 @@ def compute_fine_Rt(atten, pts1, pts2, model_pts=None, dis_thres=0.15):
     return pred_R, pred_t, pose_score
 
 
-def compute_fine_Rt_overlap(atten, score, pts1, pts2, model_pts=None, dis_thres=0.15):
+def fine_assignment(atten, score, pts2):
+    """The fine-stage assignment exactly as compute_fine_Rt_overlap builds it (no gradient needed by callers).
+
+    Returns (assignment (B,N1,N2) after the dustbin masks, row weight (B,N1), rough position per query point
+    (B,N1,3) = assignment-weighted average of template points, gated (B,N1) = row weight > 1e-6)."""
+    atten = atten.float()
+    pts2 = pts2.float()
+    B, n1p, n2p = atten.shape
+    N1, N2 = n1p - 1, n2p - 1
+    ones = torch.ones((B, 1), device=atten.device)
+    s1 = torch.cat((ones, score[:, :N1].float()), dim=1)[:, :, None].expand(B, N1 + 1, N2 + 1)
+    s2 = torch.cat((ones, score[:, N1:].float()), dim=1)[:, None, :].expand(B, N1 + 1, N2 + 1)
+    a = torch.softmax(atten, dim=2) * torch.softmax(atten, dim=1) * s1 * s2
+    label1 = torch.max(a[:, 1:, :], dim=2)[1]
+    label2 = torch.max(a[:, :, 1:], dim=1)[1]
+    a = a[:, 1:, 1:] * (label1 > 0).float().unsqueeze(2) * (label2 > 0).float().unsqueeze(1)
+    row = a.sum(2)
+    rough = (a / (row.unsqueeze(2) + 1e-6)) @ pts2
+    return a, row, rough, row > 1e-6
+
+
+def compute_fine_Rt_overlap(atten, score, pts1, pts2, model_pts=None, dis_thres=0.15,
+                            irls_iters=0, irls_c=3.0):
+    """Solve the fine-stage pose from the assignment matrix.
+
+    `irls_iters` > 0 turns on iteratively reweighted least squares. Upstream
+    solves the pose ONCE, weighted by the network's own confidence. But the
+    residuals are information that only exists AFTER a pose is available:
+    a correspondence the network liked but which lands far from where the
+    solved pose puts it is probably a bad match. Each extra iteration
+    recomputes the weights from the current residuals and re-solves.
+
+    The robust scale is taken from the residuals themselves (median over the
+    correspondences that carry weight), NOT a fixed distance -- this research
+    line's history is that every hand-tuned global threshold failed to
+    transfer across datasets, and a data-derived scale has no such knob.
+    Weights are Cauchy, `w = w_net / (1 + (r / (c*s))^2)`, which decays
+    smoothly rather than cutting off, so no correspondence is ever hard-
+    discarded on a single iteration's estimate.
+
+    Default 0 is a no-op, leaving the function bit-identical to upstream.
+    """
     WSVD = WeightedProcrustes(weight_thresh=0.001)
+    if irls_iters < 0:
+        raise ValueError(f"irls_iters must be >= 0, got {irls_iters}")
     if model_pts is None:
         model_pts = pts2
+    if hooks.fine_atten is not None:  # optional fine-stage hook (core/unopose/pipelines/hooks.py); off by default
+        atten = hooks.fine_atten(atten, pts2, model_pts)
     atten = atten.float()
     pts1 = pts1.float()
     pts2 = pts2.float()
@@ -547,13 +619,29 @@ def compute_fine_Rt_overlap(atten, score, pts1, pts2, model_pts=None, dis_thres=
     label2 = torch.max(assginment_mat[:, :, 1:], dim=1)[1]
 
     assginment_mat = assginment_mat[:, 1:, 1:] * (label1 > 0).float().unsqueeze(2) * (label2 > 0).float().unsqueeze(1)
-    # max_idx = torch.max(assginment_mat, dim=2, keepdim=True)[1]
-    # pred_pts = torch.gather(pts2, 1, max_idx.expand_as(pts1))
     normalized_assginment_mat = assginment_mat / (assginment_mat.sum(2, keepdim=True) + 1e-6)
     pred_pts = normalized_assginment_mat @ pts2
 
     assginment_score = assginment_mat.sum(2)
     pred_R, pred_t = WSVD(pred_pts, pts1, assginment_score)
+
+    for _ in range(irls_iters):
+        # Residual convention matches the scoring below and the coarse stage:
+        # the solved transform maps pred_pts -> pts1, so its inverse applied to
+        # pts1 should land back on pred_pts.
+        resid = torch.norm((pts1 - pred_t.unsqueeze(1)) @ pred_R - pred_pts, dim=2)  # (B, N1)
+        carries_weight = assginment_score > 0
+        # Robust scale from the residuals of the correspondences that actually
+        # vote -- `nanmedian` so unweighted points cannot drag it.
+        r_valid = torch.where(carries_weight, resid, torch.full_like(resid, float("nan")))
+        scale = torch.nanmedian(r_valid, dim=1, keepdim=True).values
+        scale = torch.nan_to_num(scale, nan=0.0).clamp_min(1e-6)
+        w = assginment_score / (1.0 + (resid / (irls_c * scale)) ** 2)
+        # A degenerate iteration (weights collapsed, or a non-finite scale)
+        # would make WSVD meaningless -- keep the previous estimate instead.
+        if not torch.isfinite(w).all() or bool((w.sum(1) <= 0).any()):
+            break
+        pred_R, pred_t = WSVD(pred_pts, pts1, w)
 
     # compute score
     pred_pts = (pts1 - pred_t.unsqueeze(1)) @ pred_R
@@ -630,8 +718,8 @@ def rigid_transform_3d(A, B, weights=None, weight_threshold=0):
     Bm = B - centroid_B
 
     # construct weight covariance matrix
-    Weight = torch.diag_embed(weights)  # 升维度，然后变为对角阵
-    H = Am.permute(0, 2, 1) @ Weight @ Bm  # permute : tensor中的每一块做转置
+    Weight = torch.diag_embed(weights)  # expand dims, then turn into a diagonal matrix
+    H = Am.permute(0, 2, 1) @ Weight @ Bm  # permute: transpose each block in the tensor
 
     # find rotation
     U, S, Vt = torch.svd(H.cpu())

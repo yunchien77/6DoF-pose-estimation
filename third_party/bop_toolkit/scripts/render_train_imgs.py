@@ -4,15 +4,10 @@
 """Renders RGB-D images of an object model."""
 
 import os
+
 import cv2
-
-from bop_toolkit_lib import config
-from bop_toolkit_lib import dataset_params
-from bop_toolkit_lib import inout
-from bop_toolkit_lib import misc
-from bop_toolkit_lib import renderer
-from bop_toolkit_lib import view_sampler
-
+from bop_toolkit_lib import config, dataset_params, inout, misc, view_sampler
+from bop_toolkit_lib.rendering import renderer
 
 # PARAMETERS.
 ################################################################################
@@ -74,7 +69,9 @@ out_rgb_tpath = os.path.join("{out_path}", "{obj_id:06d}", "rgb", "{im_id:06d}.p
 out_depth_tpath = os.path.join("{out_path}", "{obj_id:06d}", "depth", "{im_id:06d}.png")
 out_scene_camera_tpath = os.path.join("{out_path}", "{obj_id:06d}", "scene_camera.json")
 out_scene_gt_tpath = os.path.join("{out_path}", "{obj_id:06d}", "scene_gt.json")
-out_views_vis_tpath = os.path.join("{out_path}", "{obj_id:06d}", "views_radius={radius}.ply")
+out_views_vis_tpath = os.path.join(
+    "{out_path}", "{obj_id:06d}", "views_radius={radius}.ply"
+)
 ################################################################################
 
 
@@ -102,7 +99,9 @@ fx_d, fy_d, cx_d, cy_d = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
 
 # Create the RGB renderer.
 width_rgb, height_rgb = im_size_rgb[0], im_size_rgb[1]
-ren_rgb = renderer.create_renderer(width_rgb, height_rgb, renderer_type, mode="rgb", shading=shading)
+ren_rgb = renderer.create_renderer(
+    width_rgb, height_rgb, renderer_type, mode="rgb", shading=shading
+)
 ren_rgb.set_light_ambient_weight(ambient_weight)
 
 # Add object models to the RGB renderer.
@@ -117,7 +116,9 @@ for obj_id in obj_ids:
     dp_camera["im_size"][0],
     dp_camera["im_size"][1],
 )
-ren_depth = renderer.create_renderer(width_depth, height_depth, renderer_type, mode="depth")
+ren_depth = renderer.create_renderer(
+    width_depth, height_depth, renderer_type, mode="depth"
+)
 
 # Add object models to the depth renderer.
 for obj_id in obj_ids:
@@ -126,8 +127,14 @@ for obj_id in obj_ids:
 # Render training images for all object models.
 for obj_id in obj_ids:
     # Prepare output folders.
-    misc.ensure_dir(os.path.dirname(out_rgb_tpath.format(out_path=out_path, obj_id=obj_id, im_id=0)))
-    misc.ensure_dir(os.path.dirname(out_depth_tpath.format(out_path=out_path, obj_id=obj_id, im_id=0)))
+    misc.ensure_dir(
+        os.path.dirname(out_rgb_tpath.format(out_path=out_path, obj_id=obj_id, im_id=0))
+    )
+    misc.ensure_dir(
+        os.path.dirname(
+            out_depth_tpath.format(out_path=out_path, obj_id=obj_id, im_id=0)
+        )
+    )
 
     # Load model.
     model_path = dp_model["model_tpath"].format(obj_id=obj_id)
@@ -135,7 +142,9 @@ for obj_id in obj_ids:
 
     # Load model texture.
     if "texture_file" in model:
-        model_texture_path = os.path.join(os.path.dirname(model_path), model["texture_file"])
+        model_texture_path = os.path.join(
+            os.path.dirname(model_path), model["texture_file"]
+        )
         model_texture = inout.load_im(model_texture_path)
     else:
         model_texture = None
@@ -147,7 +156,11 @@ for obj_id in obj_ids:
         # Sample viewpoints.
         view_sampler_mode = "hinterstoisser"  # 'hinterstoisser' or 'fibonacci'.
         views, views_level = view_sampler.sample_views(
-            min_n_views, radius, dp_split_test["azimuth_range"], dp_split_test["elev_range"], view_sampler_mode
+            min_n_views,
+            radius,
+            dp_split_test["azimuth_range"],
+            dp_split_test["elev_range"],
+            view_sampler_mode,
         )
 
         misc.log("Sampled views: " + str(len(views)))
@@ -158,11 +171,19 @@ for obj_id in obj_ids:
         # Render the object model from all views.
         for view_id, view in enumerate(views):
             if view_id % 10 == 0:
-                misc.log("Rendering - obj: {}, radius: {}, view: {}/{}".format(obj_id, radius, view_id, len(views)))
+                misc.log(
+                    "Rendering - obj: {}, radius: {}, view: {}/{}".format(
+                        obj_id, radius, view_id, len(views)
+                    )
+                )
 
             # Rendering.
-            rgb = ren_rgb.render_object(obj_id, view["R"], view["t"], fx_rgb, fy_rgb, cx_rgb, cy_rgb)["rgb"]
-            depth = ren_depth.render_object(obj_id, view["R"], view["t"], fx_d, fy_d, cx_d, cy_d)["depth"]
+            rgb = ren_rgb.render_object(
+                obj_id, view["R"], view["t"], fx_rgb, fy_rgb, cx_rgb, cy_rgb
+            )["rgb"]
+            depth = ren_depth.render_object(
+                obj_id, view["R"], view["t"], fx_d, fy_d, cx_d, cy_d
+            )["depth"]
 
             # Convert depth so it is in the same units as other images in the dataset.
             depth /= float(dp_camera["depth_scale"])
@@ -173,9 +194,13 @@ for obj_id in obj_ids:
             # rgb = scipy.misc.imresize(rgb, par['cam']['im_size'][::-1], 'bicubic')
 
             # Save the rendered images.
-            out_rgb_path = out_rgb_tpath.format(out_path=out_path, obj_id=obj_id, im_id=im_id)
+            out_rgb_path = out_rgb_tpath.format(
+                out_path=out_path, obj_id=obj_id, im_id=im_id
+            )
             inout.save_im(out_rgb_path, rgb)
-            out_depth_path = out_depth_tpath.format(out_path=out_path, obj_id=obj_id, im_id=im_id)
+            out_depth_path = out_depth_tpath.format(
+                out_path=out_path, obj_id=obj_id, im_id=im_id
+            )
             inout.save_depth(out_depth_path, depth)
 
             # Get 2D bounding box of the object model at the ground truth pose.
@@ -188,10 +213,16 @@ for obj_id in obj_ids:
                 "view_level": int(views_level[view_id]),
             }
 
-            scene_gt[im_id] = [{"cam_R_m2c": view["R"], "cam_t_m2c": view["t"], "obj_id": int(obj_id)}]
+            scene_gt[im_id] = [
+                {"cam_R_m2c": view["R"], "cam_t_m2c": view["t"], "obj_id": int(obj_id)}
+            ]
 
             im_id += 1
 
     # Save metadata.
-    inout.save_scene_camera(out_scene_camera_tpath.format(out_path=out_path, obj_id=obj_id), scene_camera)
-    inout.save_scene_gt(out_scene_gt_tpath.format(out_path=out_path, obj_id=obj_id), scene_gt)
+    inout.save_scene_camera(
+        out_scene_camera_tpath.format(out_path=out_path, obj_id=obj_id), scene_camera
+    )
+    inout.save_scene_gt(
+        out_scene_gt_tpath.format(out_path=out_path, obj_id=obj_id), scene_gt
+    )

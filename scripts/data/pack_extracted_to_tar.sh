@@ -7,6 +7,7 @@
 # Run it again after an interruption: finished tars are skipped.  Quiet while packing; progress:
 #   ls datasets/MegaPose-Training-Data/MegaPose-GSO/train_pbr_tar/*.tar | wc -l
 #   JOBS=2  shards packed at the same time (more does not help on one hard disk)
+#   MP_GROUPS=GSO  only these groups (default "GSO ShapeNetCore"): to do it in two rounds when there is not room for both copies
 #   DATA=<dir>  data folder (default <repo>/datasets/MegaPose-Training-Data)
 SELF=$(readlink -f "$0")
 REPO=$(cd "$(dirname "$SELF")/../.." && pwd)
@@ -28,17 +29,21 @@ if [ "$1" = one ]; then          # internal: one shard
   exit 0
 fi
 
-for G in GSO ShapeNetCore; do mkdir -p MegaPose-$G/train_pbr_tar; done
-for G in GSO ShapeNetCore; do
+GS=${MP_GROUPS:-GSO ShapeNetCore}
+for G in $GS; do mkdir -p MegaPose-$G/train_pbr_tar; done
+for G in $GS; do
   seq 0 1039 | xargs -P ${JOBS:-2} -I{} bash "$SELF" one $G {}
 done 2>&1 | tee pack_extracted_to_tar.log
-NG=$(ls MegaPose-GSO/train_pbr_tar/*.tar 2>/dev/null | wc -l); NS=$(ls MegaPose-ShapeNetCore/train_pbr_tar/*.tar 2>/dev/null | wc -l)
-echo "packed: GSO $NG/1040  ShapeNetCore $NS/1040  FAIL $(grep -c FAIL pack_extracted_to_tar.log)  MISSING $(grep -c MISSING pack_extracted_to_tar.log)"
-[ "$NG" = 1040 ] && [ "$NS" = 1040 ] || { echo "not complete: run this script again (MISSING = that shard was never extracted)"; exit 1; }
+OK=1; LINE="packed:"
+for G in $GS; do
+  N=$(ls MegaPose-$G/train_pbr_tar/*.tar 2>/dev/null | wc -l); LINE="$LINE $G $N/1040 "; [ "$N" = 1040 ] || OK=0
+done
+echo "$LINE FAIL $(grep -c FAIL pack_extracted_to_tar.log)  MISSING $(grep -c MISSING pack_extracted_to_tar.log)"
+[ $OK = 1 ] || { echo "not complete: run this script again (MISSING = that shard was never extracted)"; exit 1; }
 
 cd $REPO
 source ~/anaconda3/etc/profile.d/conda.sh && conda activate unopose
-PYTHONPATH=. python scripts/data/build_megapose_tar_index.py --data-dir $DATA --jobs 4 || exit 1
-# 3 random images of every shard (all 7 files each) compared with the extracted files
-PYTHONPATH=. python scripts/data/validate_megapose_tar.py bytes --data-dir $DATA --per-shard 3 2>&1 | grep -v -E "images checked|[Ww]arn|pynvml"
+PYTHONPATH=. python scripts/data/build_megapose_tar_index.py --data-dir $DATA --jobs 4 --groups $GS || exit 1
+# 3 random images of every shard (all 7 files each) compared with the extracted files (shards whose folders are already gone are skipped)
+PYTHONPATH=. python scripts/data/validate_megapose_tar.py bytes --data-dir $DATA --per-shard 3 2>&1 | grep -v -E "images checked|skipped|[Ww]arn|pynvml"
 exit ${PIPESTATUS[0]}

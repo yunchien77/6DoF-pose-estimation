@@ -20,6 +20,8 @@ if [ "$1" = one ]; then          # internal: one shard
   src=MegaPose-$G/train_pbr_web/$i; dst=MegaPose-$G/train_pbr_tar/shard-$i.tar
   [ -f $dst ] && exit 0
   [ -d $src ] || { echo "MISSING $G $i"; exit 0; }
+  # get_train_data.sh marks a shard finished in MegaPose-<G>/.done/; never pack a shard that is still being (or was not fully) extracted
+  [ -d MegaPose-$G/.done ] && [ ! -f MegaPose-$G/.done/$i ] && { echo "NOTDONE $G $i"; exit 0; }
   # members as flat names, sorted so that the files of one image are next to each other (same as the Hugging Face shards)
   if (cd $src && find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort) | tar -cf $dst.part -C $src --no-recursion -T -; then
     mv $dst.part $dst
@@ -38,8 +40,8 @@ OK=1; LINE="packed:"
 for G in $GS; do
   N=$(ls MegaPose-$G/train_pbr_tar/*.tar 2>/dev/null | wc -l); LINE="$LINE $G $N/1040 "; [ "$N" = 1040 ] || OK=0
 done
-echo "$LINE FAIL $(grep -c FAIL pack_extracted_to_tar.log)  MISSING $(grep -c MISSING pack_extracted_to_tar.log)"
-[ $OK = 1 ] || { echo "not complete: run this script again (MISSING = that shard was never extracted)"; exit 1; }
+echo "$LINE FAIL $(grep -c FAIL pack_extracted_to_tar.log)  MISSING $(grep -c MISSING pack_extracted_to_tar.log)  NOTDONE $(grep -c NOTDONE pack_extracted_to_tar.log)"
+[ $OK = 1 ] || { echo "not complete: run this script again (MISSING = never extracted, NOTDONE = get_train_data.sh has not finished that shard)"; exit 1; }
 
 cd $REPO
 source ~/anaconda3/etc/profile.d/conda.sh && conda activate unopose

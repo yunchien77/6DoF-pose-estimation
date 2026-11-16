@@ -6,7 +6,7 @@
            Includes a control (the original way twice) that must also be equal, otherwise the seeding is not complete.
            Needs the extracted shards too.                          --index-dir <dir> [--n 500]
   coverage every training image and every template image of the dataset index is found in the tar index with all needed members.
-           For the new server (tars only).                          [--index-dir <dir>]
+           For the new server (tars only).                          [--index-dir <dir>] [--groups GSO]
   bench    data-loading speed (samples / s) with DataLoader workers, the way training reads (random images).
            --way tar|files [--workers 8] [--batches 30]
 
@@ -169,7 +169,12 @@ def check_coverage(a):
     r = ds.reader()
     miss = 0
     t0 = time.time()
+    groups = set(a.groups)
+    n_train = 0
     for k, p in enumerate(ds.dataset_paths):
+        if p.decode().split("/")[0][len("MegaPose-"):] not in groups:
+            continue
+        n_train += 1
         if r.has_all(osp.join(ds.data_dir, p.decode())) is not True:
             miss += 1
             if miss <= 5:
@@ -177,7 +182,7 @@ def check_coverage(a):
         if (k + 1) % 500000 == 0:
             print(f"  {k + 1}/{len(ds.dataset_paths)} training images ({time.time() - t0:.0f} s)", flush=True)
     tmiss = tn = 0
-    for gi, g in enumerate(GROUPS):
+    for gi, g in enumerate(g for g in GROUPS if g in groups):
         for sh, key in zip(ds.tem_shard[g], ds.tem_key[g]):
             tn += 1
             head = f"MegaPose-{g}/train_pbr_web/{int(sh):06d}/{key.decode()}"
@@ -185,10 +190,11 @@ def check_coverage(a):
                 tmiss += 1
                 if tmiss <= 5:
                     print(f"  missing template image: {head}")
-    print(f"coverage: training images {len(ds.dataset_paths)}, missing {miss}; template entries {tn}, missing {tmiss}")
+    print(f"coverage ({' '.join(sorted(groups))}): training images {n_train}, missing {miss}; template entries {tn}, missing {tmiss}")
     for g, m in r.meta["groups"].items():
-        print(f"  {g}: {m['shards']} shards, {m['images']} images, {m['incomplete_images']} incomplete, bad tars {m['bad_tars']}")
-    return miss == 0 and tmiss == 0
+        if g in groups:
+            print(f"  {g}: {m['shards']} shards, {m['images']} images, {m['incomplete_images']} incomplete, bad tars {m['bad_tars']}")
+    return miss == 0 and tmiss == 0 and n_train > 0
 
 
 def bench(a):
@@ -219,6 +225,7 @@ def main():
     ap.add_argument("--index-dir", default=None, help=f"default <data-dir>/tar_index")
     ap.add_argument("--per-shard", type=int, default=300)
     ap.add_argument("--n", type=int, default=500)
+    ap.add_argument("--groups", nargs="+", default=list(GROUPS), choices=list(GROUPS), help="coverage: only these groups")
     ap.add_argument("--way", choices=["tar", "files"], default="tar")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--batch", type=int, default=32)

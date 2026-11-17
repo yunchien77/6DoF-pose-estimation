@@ -5,18 +5,23 @@ Only where the bytes come from changes.  The original module calls load_im / loa
 in each process that uses this class those four names are wrapped: a path that is a member of an indexed tar shard is decoded from the
 tar bytes with the same decoder the original function uses (imageio.imread / orjson / load_gt_from_bytes / load_masks_from_bytes),
 anything else goes to the original function unchanged.  _check_path asks the index instead of os.path.exists.
+The original index also decides which shards exist by listing MegaPose-<G>/train_pbr_web/ (os.listdir); while it is built here, that
+listing also returns every shard in the tar index, so the same 2,008,971 images and the same templates are used after the extracted
+folders are deleted (without this, deleted shards silently drop out of training and their objects lose their templates).
 
 Use: dataloader.train.dataset._target_=core.unopose.provider.pfoneref_training_dataset_v2_tar.DatasetPoseFreeOneRefv2Tar
      (scripts/queue/retrain_arm_tar.sh sets it).  Optional: dataloader.train.dataset.tar_index_dir=<dir> (default <data_dir>/tar_index).
 Check that it gives the same inputs: scripts/data/validate_megapose_tar.py.
 """
+import os
 import os.path as osp
 
 import imageio
+import numpy as np
 import orjson
 
 import core.unopose.provider.pfoneref_training_dataset_v2 as base
-from core.unopose.provider.megapose_tar import MegaPoseTarReader
+from core.unopose.provider.megapose_tar import GROUPS, MegaPoseTarReader
 from core.unopose.utils.data_utils import load_gt_from_bytes, load_masks_from_bytes
 
 _ORIG = dict(load_im=base.load_im, load_json=base.load_json, io_load_gt=base.io_load_gt, io_load_masks=base.io_load_masks)
@@ -58,13 +63,48 @@ def install_reader(reader):
     base.load_im, base.load_json, base.io_load_gt, base.io_load_masks = _load_im, _load_json, _io_load_gt, _io_load_masks
 
 
+def indexed_shards(index_dir):
+    """-> {group: sorted shard numbers that are in the tar index}"""
+    import json
+
+    with open(osp.join(index_dir, "meta.json")) as f:
+        groups = json.load(f)["groups"]
+    out = {}
+    for g in GROUPS:
+        if g in groups:
+            ss = np.load(osp.join(index_dir, f"{g}_shard_start.npy"))
+            out[g] = [s for s in range(len(ss) - 1) if ss[s + 1] > ss[s]]
+    return out
+
+
+class _OsListingIndexedShards:
+    """Stands in for `os` in the original module while its sample index is built: listing MegaPose-<G>/train_pbr_web/ returns what is
+    on disk plus the 6-digit folder name of every shard in the tar index.  Everything else is the real os module."""
+
+    def __init__(self, data_dir, shards):
+        self._extra = {osp.abspath(osp.join(data_dir, f"MegaPose-{g}", "train_pbr_web")): {f"{s:06d}" for s in v} for g, v in shards.items()}
+
+    def listdir(self, path):
+        extra = self._extra.get(osp.abspath(path))
+        if extra is None:
+            return os.listdir(path)
+        return sorted(set(os.listdir(path) if osp.isdir(path) else []) | extra)
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
 class DatasetPoseFreeOneRefv2Tar(base.DatasetPoseFreeOneRefv2):
     def __init__(self, cfg, num_img_per_epoch=-1, tar_index_dir=None):
-        super().__init__(cfg, num_img_per_epoch=num_img_per_epoch)
-        self.tar_index_dir = tar_index_dir or osp.join(self.data_dir, "tar_index")
+        self.tar_index_dir = tar_index_dir or osp.join(cfg.data_dir, "tar_index")
         if not osp.exists(osp.join(self.tar_index_dir, "meta.json")):
             raise FileNotFoundError(f"no tar index in {self.tar_index_dir} (scripts/data/build_megapose_tar_index.py)")
         self._reader = None
+        base.os = _OsListingIndexedShards(cfg.data_dir, indexed_shards(self.tar_index_dir))
+        try:
+            super().__init__(cfg, num_img_per_epoch=num_img_per_epoch)
+        finally:
+            base.os = os
 
     def __getstate__(self):  # DataLoader workers get a copy without open file descriptors; each opens its own reader
         state = self.__dict__.copy()

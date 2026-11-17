@@ -190,11 +190,19 @@ def check_coverage(a):
                 tmiss += 1
                 if tmiss <= 5:
                     print(f"  missing template image: {head}")
-    print(f"coverage ({' '.join(sorted(groups))}): training images {n_train}, missing {miss}; template entries {tn}, missing {tmiss}")
+    # every image of key_to_shard.json must be in the sample index (the dataset leaves out shards it thinks are not on disk)
+    import orjson
+
+    n_all = 0
+    for g in sorted(groups):
+        with open(osp.join(ds.data_dir, f"MegaPose-{g}", "train_pbr_web", "key_to_shard.json"), "rb") as f:
+            n_all += len(orjson.loads(f.read()))
+    print(f"coverage ({' '.join(sorted(groups))}): training images {n_train} of {n_all} in key_to_shard.json, missing {miss}; "
+          f"template entries {tn}, missing {tmiss}")
     for g, m in r.meta["groups"].items():
         if g in groups:
             print(f"  {g}: {m['shards']} shards, {m['images']} images, {m['incomplete_images']} incomplete, bad tars {m['bad_tars']}")
-    return miss == 0 and tmiss == 0 and n_train > 0
+    return miss == 0 and tmiss == 0 and n_train == n_all > 0
 
 
 def bench(a):
